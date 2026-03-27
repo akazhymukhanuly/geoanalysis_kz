@@ -1,0 +1,87 @@
+﻿<!doctype html>
+<html lang="ru" translate="no">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <meta name="google" content="notranslate"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alatau City Bank - Клиент</title>
+  <link rel="stylesheet" href="/staticgeo/leaflet/leaflet.css" />
+  <link rel="stylesheet" href="/staticgeo/leaflet/nouislider.min.css" />
+  <link rel="stylesheet" href="/staticgeo/css/app.css?v=20260318" />
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="client-topbar" class="topbar">
+    <div class="brand-row">
+      <div class="brand-mark" aria-hidden="true"></div>
+      <div class="brand-text">
+        <div class="t1">Alatau City Bank</div>
+        <div class="t2">Аналитика клиента</div>
+      </div>
+    </div>
+    <div class="pill"><span style="opacity:.75;">Клиент</span><b id="clientIinTop">Профиль клиента</b></div>
+    <label class="pill" title="Период">
+      <span style="opacity:.8;">Период</span>
+      <select id="periodSelect">
+        <option value="day">За день</option>
+        <option value="week" selected>За неделю</option>
+        <option value="month">За месяц</option>
+        <option value="custom">Выбрать период</option>
+      </select>
+    </label>
+    <label class="pill" id="customPeriodWrap" style="display:none;" title="Пользовательский период">
+      <span style="opacity:.8;">С</span>
+      <input type="date" id="periodStart">
+      <span style="opacity:.8;">По</span>
+      <input type="date" id="periodEnd">
+    </label>
+    <div class="pill" id="slider-wrap" style="min-width:220px;">
+      <div id="time-val">00:00 — 23:00</div>
+      <div id="time-slider"></div>
+    </div>
+    <button class="pill" id="pointPlayBtn" type="button" title="Показывать точки по очереди">▶ Точки</button>
+    <button class="pill" id="routeToggleBtn" type="button" title="Показать маршрут">🗺 Маршрут</button>
+    <a href="/global">Общий вид</a>
+  </div>
+
+  <div id="clientPanel" class="panel client-panel">
+    <div class="panel-head"><strong id="clientTitle">Аналитика клиента</strong></div>
+    <div class="stats-grid">
+      <div class="stat"><div>Клиент</div><b id="clientIin">Клиент</b></div>
+      <div class="stat"><div>События</div><b id="clientEvents">0</b></div>
+      <div class="stat"><div>Уникальные точки</div><b id="clientPlaces">0</b></div>
+      <div class="stat"><div>Пиковый час</div><b id="clientTopHour">-</b></div>
+      <div class="stat"><div>Уникальные районы</div><b id="clientRayons">0</b></div>
+      <div class="stat"><div>Первое событие</div><b id="clientFirstSeen">-</b></div>
+      <div class="stat"><div>Последнее событие</div><b id="clientLastSeen">-</b></div>
+    </div>
+
+    <div class="mini-title">Почасовой профиль</div>
+    <canvas id="clientHoursChart" height="90"></canvas>
+
+    <div class="mini-title">Топ районов</div>
+    <div id="clientTopRayons"></div>
+
+    <div class="mini-title">Вероятные места</div>
+    <div id="clientInferredPlaces"></div>
+
+    <div id="selectedAuthBlock" class="hidden">
+      <div class="mini-title">Выбранная авторизация</div>
+      <div class="row-lite"><span>Время</span><b id="selAuthTime">-</b></div>
+      <div class="row-lite"><span>Час</span><b id="selAuthHour">-</b></div>
+      <div class="row-lite"><span>Район</span><b id="selAuthRayon">-</b></div>
+      <div class="row-lite"><span>Объекты рядом (<=500м)</span><b id="selAuthNear">0</b></div>
+    </div>
+
+    <div id="clientMsg"></div>
+  </div>
+
+  <script src="/staticgeo/leaflet/leaflet.js"></script>
+  <script src="/staticgeo/leaflet/leaflet-heat.js"></script>
+  <script src="/staticgeo/leaflet/nouislider.min.js"></script>
+  <div id="chartTip"></div>
+  <script src="/staticgeo/js/client.js?v=20260318"></script>
+</body>
+</html>

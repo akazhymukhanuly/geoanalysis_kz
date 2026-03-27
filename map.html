@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+    
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.3/dist/leaflet.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.2.2/dist/css/bootstrap.min.css"/>
+    <link rel="stylesheet" href="https://netdna.bootstrapcdn.com/bootstrap/3.0.0/css/bootstrap-glyphicons.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.2.0/css/all.min.css"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/Leaflet.awesome-markers/2.0.2/leaflet.awesome-markers.css"/>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/python-visualization/folium/folium/templates/leaflet.awesome.rotate.min.css"/>
+    
+            <meta name="viewport" content="width=device-width,
+                initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+            <style>
+                #map_6ef4e97d09467eb9680015a1666d6ead {
+                    position: relative;
+                    width: 100.0%;
+                    height: 100.0%;
+                    left: 0.0%;
+                    top: 0.0%;
+                }
+                .leaflet-container { font-size: 1rem; }
+            </style>
+
+            <style>html, body {
+                width: 100%;
+                height: 100%;
+                margin: 0;
+                padding: 0;
+            }
+            </style>
+
+            <style>#map {
+                position:absolute;
+                top:0;
+                bottom:0;
+                right:0;
+                left:0;
+                }
+            </style>
+
+            <script>
+                L_NO_TOUCH = false;
+                L_DISABLE_3D = false;
+            </script>
+
+        
+</head>
+<body>
+    
+    
+    <script>
+    (function() {
+      const MAP_VAR = "map_6ef4e97d09467eb9680015a1666d6ead";
+
+      function initDynamicLayer() {
+        const MAP = window[MAP_VAR];
+        if (!MAP || typeof MAP.getBounds !== "function") {
+          setTimeout(initDynamicLayer, 200);
+          return;
+        }
+
+        const pointsLayer = L.layerGroup().addTo(MAP);
+        let t = null;
+
+        function loadPoints() {
+          const b = MAP.getBounds();
+          const z = MAP.getZoom();
+
+          const min_lat = b.getSouth();
+          const max_lat = b.getNorth();
+          const min_lon = b.getWest();
+          const max_lon = b.getEast();
+
+          fetch(`/get_points?min_lat=${min_lat}&max_lat=${max_lat}&min_lon=${min_lon}&max_lon=${max_lon}&zoom=${z}`)
+            .then(r => r.json())
+            .then(data => {
+              pointsLayer.clearLayers();
+
+              data.forEach(p => {
+                if (p.count !== undefined) {
+                  L.circleMarker([p.lat, p.lon], {
+                    radius: Math.min(25, 6 + Math.log(p.count + 1)),
+                    fillOpacity: 0.6,
+                    weight: 1
+                  }).bindPopup("Count: " + p.count).addTo(pointsLayer);
+                } else {
+                  L.circleMarker([p.lat, p.lon], {
+                    radius: 4,
+                    fillOpacity: 0.7,
+                    weight: 0
+                  }).addTo(pointsLayer);
+                }
+              });
+            })
+            .catch(err => console.error("get_points error:", err));
+        }
+
+        function delayedLoad() {
+          clearTimeout(t);
+          t = setTimeout(loadPoints, 300);
+        }
+
+        MAP.on("moveend", delayedLoad);
+        MAP.on("zoomend", delayedLoad);
+        loadPoints();
+      }
+
+      initDynamicLayer();
+    })();
+    </script>
+    
+    
+            <div class="folium-map" id="map_6ef4e97d09467eb9680015a1666d6ead" ></div>
+        
+</body>
+<script>
+    
+    
+            var map_6ef4e97d09467eb9680015a1666d6ead = L.map(
+                "map_6ef4e97d09467eb9680015a1666d6ead",
+                {
+                    center: [43.2432, 76.9],
+                    crs: L.CRS.EPSG3857,
+                    ...{
+  "zoom": 12,
+  "zoomControl": true,
+  "preferCanvas": true,
+  "zoomSnap": 2,
+  "zoomDelta": 2,
+}
+
+                }
+            );
+
+            
+
+        
+    
+            var tile_layer_4b6fbfcd67dc02be22e31f298da709b4 = L.tileLayer(
+                "http://127.0.0.1:8080/tiles/{z}/{x}/{y}.png",
+                {
+  "minZoom": 6,
+  "maxZoom": 18,
+  "maxNativeZoom": 18,
+  "noWrap": false,
+  "attribution": "\u00a9 AlatauCityBank | 2025",
+  "subdomains": "abc",
+  "detectRetina": false,
+  "tms": false,
+  "opacity": 1,
+}
+
+            );
+        
+    
+            tile_layer_4b6fbfcd67dc02be22e31f298da709b4.addTo(map_6ef4e97d09467eb9680015a1666d6ead);
+        
+</script>
+</html>

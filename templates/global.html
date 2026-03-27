@@ -1,0 +1,182 @@
+﻿<!doctype html>
+<html lang="ru" translate="no">
+<head>
+  <meta charset="utf-8"/>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
+  <meta name="google" content="notranslate"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Геоаналитика авторизаций</title>
+
+  <link rel="stylesheet" href="/staticgeo/leaflet/leaflet.css"/>
+  <link rel="stylesheet" href="/staticgeo/leaflet/nouislider.min.css"/>
+  <link rel="stylesheet" href="/staticgeo/leaflet/MarkerCluster.css"/>
+  <link rel="stylesheet" href="/staticgeo/leaflet/MarkerCluster.Default.css"/>
+  <link rel="stylesheet" href="/staticgeo/css/app.css?v=20260318"/>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100vh; width: 100%; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+
+<div id="topbar">
+  <div id="brand">
+    <div class="brand-row">
+      <div class="brand-mark" aria-hidden="true"></div>
+      <div class="brand-text">
+        <div class="t1">Alatau City Bank</div>
+        <div class="t2">Консоль геоаналитики</div>
+      </div>
+    </div>
+  </div>
+  <div id="controls">
+    <label class="pill" title="Слой тепла: События">
+      <input type="radio" name="mode" id="modeEvents" checked> События
+    </label>
+    <label class="pill" title="Слой тепла: Уникальные ИИН">
+      <input type="radio" name="mode" id="modeUnique"> Уникальные ИИН
+    </label>
+
+    <label class="pill" title="Фильтр по областям">
+      <span style="opacity:.8;">Область</span>
+      <select id="oblastSelect">
+        <option value="ALL">Весь Казахстан</option>
+      </select>
+    </label>
+
+    <label class="pill" title="Показывать детальные границы (районы)">
+      <input type="checkbox" id="showDetails" checked> Границы
+    </label>
+
+    <label class="pill" title="Показать кластеризацию">
+      <input type="checkbox" id="showClusters"> Кластеры
+    </label>
+
+    <label class="pill" title="Период агрегирования">
+      <span style="opacity:.8;">Период</span>
+      <select id="periodSelect">
+        <option value="day">За день</option>
+        <option value="week" selected>За неделю</option>
+        <option value="month">За месяц</option>
+        <option value="custom">Выбрать период</option>
+      </select>
+    </label>
+
+    <label class="pill" id="customPeriodWrap" style="display:none;" title="Пользовательский период">
+      <span style="opacity:.8;">С</span>
+      <input type="date" id="periodStart">
+      <span style="opacity:.8;">По</span>
+      <input type="date" id="periodEnd">
+    </label>
+
+    <div class="pill" id="slider-wrap">
+      <div id="time-val">09:00 — 18:00</div>
+      <div id="time-slider"></div>
+    </div>
+
+    <button class="pill" id="hourPlayBtn" type="button" title="Проигрывать по часам">▶ По часам</button>
+    <label class="pill" title="Закрасить районы по плотности">
+      <input type="checkbox" id="showChoropleth"> Хороплет
+    </label>
+    <button class="pill" id="darkModeBtn" type="button" title="Тёмная тема">🌙</button>
+  </div>
+  <button class="pill topbar-toggle" id="topbarToggle" type="button" title="Свернуть верхнюю панель">▴ Свернуть</button>
+</div>
+
+<div id="dashbar" style="display:none;">
+  <div class="db-card"><span>События</span><b id="dbEvents">0</b><em id="dbEventsDelta"></em></div>
+  <div class="db-card"><span>Уникальные ИИН</span><b id="dbUsers">0</b><em id="dbUsersDelta"></em></div>
+  <div class="db-card"><span>Активные районы</span><b id="dbRayons">0</b></div>
+  <div class="db-card"><span>Тег районов</span><b id="dbRayonPct">0%</b></div>
+  <div class="db-card"><span>Период</span><b id="dbPeriod">-</b></div>
+  <div class="db-card"><span>Охват районов</span><b id="dbCoverage">—</b></div>
+</div>
+
+<div id="sidebar">
+  <div id="sb-head">
+    <div>
+      <div id="sb-title">Регион</div>
+      <div id="sb-sub">Клик по району • KPI по фильтру</div>
+    </div>
+    <button id="sb-close">x</button>
+    <input id="rayonSearch" class="rayon-search" type="text" placeholder="Найти район…" autocomplete="off">
+  </div>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="l">Авторизаций (события)</div>
+      <div class="v" id="kpiEvents">0</div>
+      <div class="s">в выбранный интервал</div>
+    </div>
+    <div class="kpi">
+      <div class="l">Уникальных IIN</div>
+      <div class="v" id="kpiUsers">0</div>
+      <div class="s">в выбранный интервал</div>
+    </div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="l">Пиковый час</div>
+      <div class="v" id="kpiTopHour">—</div>
+      <div class="s">пик активности</div>
+    </div>
+    <div class="kpi">
+      <div class="l">Режим</div>
+      <div class="v" id="kpiMode">События</div>
+      <div class="s">текущий режим слоя</div>
+    </div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="l">Область (события)</div>
+      <div class="v" id="kpiOblastEvents">0</div>
+      <div class="s">итог по области</div>
+    </div>
+    <div class="kpi">
+      <div class="l">Область (пользователи)</div>
+      <div class="v" id="kpiOblastUsers">0</div>
+      <div class="s">уникальные IIN</div>
+    </div>
+  </div>
+
+  <div id="miniChartWrap">
+    <div id="miniChartTitle" style="display:flex;align-items:center;gap:8px;">
+      <span>Распределение по часам</span>
+      <button id="chartToggleBtn" type="button" class="chart-toggle-btn" title="Переключить вид">7×24</button>
+    </div>
+    <canvas id="miniChart"></canvas>
+    <canvas id="dowHourChart" style="display:none;"></canvas>
+  </div>
+
+  <div id="hotspots">
+    <div id="choroplethLegend" style="display:none;margin-bottom:12px;"></div>
+    <h4>Топ районов</h4>
+    <div id="topRayonsList"></div>
+    <h4>Качество данных</h4>
+    <div id="dataQuality"></div>
+    <h4 id="devicesTitle" style="display:none;">Устройства</h4>
+    <div id="devicesList"></div>
+    <h4>Топ зон активности</h4>
+    <div id="hsList"></div>
+  </div>
+</div>
+
+<div id="legend">
+  <div class="t">Интенсивность тепловой карты</div>
+  <div class="bar"></div>
+  <div class="s"><span>низкая</span><span>высокая</span></div>
+</div>
+
+<div id="chartTip"></div>
+
+<script src="/staticgeo/leaflet/leaflet.js"></script>
+<script src="/staticgeo/leaflet/leaflet-heat.js"></script>
+<script src="/staticgeo/leaflet/turf.min.js"></script>
+<script src="/staticgeo/leaflet/nouislider.min.js"></script>
+<script src="/staticgeo/leaflet/leaflet.markercluster.js"></script>
+<script src="/staticgeo/js/global.js?v=20260318"></script>
+</body>
+</html>

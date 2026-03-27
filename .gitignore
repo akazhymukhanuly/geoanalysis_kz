@@ -1,0 +1,23 @@
+# Database files
+*.duckdb
+*.duckdb.wal
+
+# Data files (large / sensitive)
+data/
+map_cache/
+
+# Large geo files
+ne_10m_admin_0_countries.geojson
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Claude
+.claude/
+
+# Env
+.env
+*.env

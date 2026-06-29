@@ -54,7 +54,19 @@
     selAuthRayon: document.getElementById("selAuthRayon"),
     selAuthNear: document.getElementById("selAuthNear"),
     routeToggleBtn: document.getElementById("routeToggleBtn"),
+    journeyToggleBtn: document.getElementById("journeyToggleBtn"),
+    journeySection: document.getElementById("journeySection"),
+    journeyDayList: document.getElementById("journeyDayList"),
+    journeyCloseBtn: document.getElementById("journeyCloseBtn"),
     clientPanel: document.getElementById("clientPanel"),
+    ptAll: document.getElementById("ptAll"),
+    ptTransfer: document.getElementById("ptTransfer"),
+    ptNoTransfer: document.getElementById("ptNoTransfer"),
+    transferBlock: document.getElementById("transferBlock"),
+    trCount: document.getElementById("trCount"),
+    trConvPct: document.getElementById("trConvPct"),
+    trTotalKzt: document.getElementById("trTotalKzt"),
+    trPurposeList: document.getElementById("trPurposeList"),
   };
 
   const state = {
@@ -68,6 +80,11 @@
     isPlayback: false,
     routeEnabled: false,
     routeLayer: null,
+    journeyOpen: false,
+    journeyDays: [],
+    journeyLayer: null,
+    activeDayIdx: -1,
+    pointFilter: "all",
     filters: {
       minH: 0,
       maxH: 23,
@@ -334,6 +351,123 @@
         el.clientInferredPlaces.appendChild(d);
       }
     });
+  }
+
+  // ---- Journey (day-by-day route) ----
+  const DAY_COLORS = ["#e63946","#2a9d8f","#e9c46a","#6a4c93","#3a86ff","#fb5607","#8338ec","#06d6a0","#ef476f","#ffd166"];
+
+  function clearJourneyLayer() {
+    if (state.journeyLayer) { try { map.removeLayer(state.journeyLayer); } catch (_) {} state.journeyLayer = null; }
+  }
+
+  function showJourneyDay(idx) {
+    clearJourneyLayer();
+    state.activeDayIdx = idx;
+    document.querySelectorAll(".journey-day").forEach((el, i) => el.classList.toggle("active", i === idx));
+
+    const day = state.journeyDays[idx];
+    if (!day || !day.points.length) return;
+
+    const pts = day.points;
+    const color = DAY_COLORS[idx % DAY_COLORS.length];
+    const layerGroup = L.layerGroup().addTo(map);
+    state.journeyLayer = layerGroup;
+
+    if (pts.length > 1) {
+      const latlngs = pts.map(p => [p.lat, p.lon]);
+      L.polyline(latlngs, { color, weight: 3, opacity: 0.8, dashArray: "6,4" }).addTo(layerGroup);
+    }
+
+    pts.forEach((p, i) => {
+      const isFirst = i === 0;
+      const isLast = i === pts.length - 1;
+      const radius = isFirst || isLast ? 9 : 5;
+      const fillColor = isFirst ? "#22c55e" : isLast ? "#ef4444" : color;
+      const marker = L.circleMarker([p.lat, p.lon], {
+        radius, color: "#fff", weight: 2, fillColor, fillOpacity: 1,
+      }).addTo(layerGroup);
+      const label = isFirst ? "Первая" : isLast ? "Последняя" : `#${i + 1}`;
+      marker.bindTooltip(`${label} • ${(p.event_ts || "").slice(11, 16)} • ${p.rayon_name || "-"}`, { sticky: true });
+    });
+
+    try { map.fitBounds(L.layerGroup([layerGroup]).getBounds?.() || L.latLngBounds(pts.map(p => [p.lat, p.lon])), { padding: [30, 30], maxZoom: 15 }); } catch (_) {}
+  }
+
+  function renderJourney(days) {
+    state.journeyDays = days || [];
+    if (!el.journeyDayList) return;
+    el.journeyDayList.innerHTML = "";
+
+    if (!days.length) {
+      el.journeyDayList.innerHTML = '<div style="font-size:12px;color:var(--muted,#697386);padding:6px;">Нет данных о маршруте (требуются event_ts)</div>';
+      return;
+    }
+
+    days.forEach((day, idx) => {
+      const color = DAY_COLORS[idx % DAY_COLORS.length];
+      const rayonText = day.rayons.slice(0, 2).join(", ") + (day.rayons.length > 2 ? "…" : "");
+      const d = document.createElement("div");
+      d.className = "journey-day";
+      d.innerHTML = `
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span style="background:${color};width:10px;height:10px;border-radius:50%;flex-shrink:0;"></span>
+          <span class="journey-day-date">${day.date}</span>
+          <span style="margin-left:auto;font-weight:700;">${day.events}</span>
+        </div>
+        ${rayonText ? `<div class="journey-day-meta">${rayonText}</div>` : ""}
+      `;
+      d.onclick = () => showJourneyDay(idx);
+      el.journeyDayList.appendChild(d);
+    });
+
+    if (days.length === 1) showJourneyDay(0);
+  }
+
+  const TR_PURPOSE_COLORS_C = {
+    p2p_local:"#0d9488", p2p_abroad:"#ef4444", invest:"#f97316",
+    conversion:"#eab308", deposit:"#8b5cf6", iban_external:"#3b82f6",
+    budget:"#ec4899", transfer:"#95a5a6",
+  };
+  const TR_PURPOSE_LABELS_C = {
+    p2p_local:"P2P локал", p2p_abroad:"P2P зарубеж", invest:"Инвестиции",
+    conversion:"Конвертация", deposit:"Депозит", iban_external:"IBAN внешний",
+    budget:"Бюджет", transfer:"Прочее",
+  };
+
+  function fmtKzt(v) {
+    if (!v) return "—";
+    if (v >= 1e9) return (v / 1e9).toFixed(1) + " млрд";
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + " млн";
+    if (v >= 1e3) return (v / 1e3).toFixed(0) + "K";
+    return Math.round(v).toLocaleString() + " ₸";
+  }
+
+  function renderTransferBlock(transfers) {
+    if (!el.transferBlock) return;
+    if (!transfers || transfers.count === 0) {
+      el.transferBlock.style.display = "none";
+      return;
+    }
+    el.transferBlock.style.display = "";
+    if (el.trCount) el.trCount.textContent = transfers.count.toLocaleString();
+    if (el.trConvPct) el.trConvPct.textContent = (transfers.conversion_pct ?? 0) + "%";
+    if (el.trTotalKzt) el.trTotalKzt.textContent = fmtKzt(transfers.total_kzt);
+
+    if (el.trPurposeList) {
+      const purposes = transfers.by_purpose || [];
+      const maxCnt = Math.max(1, ...purposes.map(p => p.count));
+      el.trPurposeList.innerHTML = purposes.map(p => {
+        const pct = Math.round((p.count / maxCnt) * 100);
+        const color = TR_PURPOSE_COLORS_C[p.purpose_cat] || "#95a5a6";
+        const label = TR_PURPOSE_LABELS_C[p.purpose_cat] || p.purpose_cat;
+        return `<div class="tr-bar">
+          <span style="width:85px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;">${label}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
+          <span style="font-size:11px;min-width:28px;text-align:right;">${p.count}</span>
+          <span style="font-size:10px;color:#697386;min-width:48px;text-align:right;">${fmtKzt(p.volume_kzt)}</span>
+        </div>`;
+      }).join("");
+    }
   }
 
   function computeStabilityScore(points) {
@@ -620,38 +754,45 @@
     marker.bindPopup(html, { maxWidth: 420 }).openPopup();
   }
 
+  const PT_COLOR_AUTH = "#2980b9";
+  const PT_COLOR_TR   = "#f97316";
+
+  function _ptFilterOk(p) {
+    if (state.pointFilter === "transfer")   return !!p.has_transfer;
+    if (state.pointFilter === "notransfer") return !p.has_transfer;
+    return true;
+  }
+
   function renderMainPoints(points) {
     pointsLayer.clearLayers();
     playLayer.clearLayers();
-    if (heatLayer) {
-      map.removeLayer(heatLayer);
-      heatLayer = null;
-    }
+    if (heatLayer) { map.removeLayer(heatLayer); heatLayer = null; }
 
+    const filtered = points.filter(_ptFilterOk);
     const heat = [];
     let bounds = null;
-    const maxInteractive = Math.min(points.length, 2000);
-    for (let idx = 0; idx < maxInteractive; idx += 1) {
-      const p = points[idx];
+    const maxInteractive = Math.min(filtered.length, 2000);
+
+    for (let idx = 0; idx < maxInteractive; idx++) {
+      const p = filtered[idx];
       const ll = [p.lat, p.lon];
+      const color = p.has_transfer ? PT_COLOR_TR : PT_COLOR_AUTH;
       heat.push([p.lat, p.lon, 0.72]);
       const marker = L.marker(ll, {
         icon: L.divIcon({
           className: "c-pulse",
-          html: '<div style="background:#2980b9;width:22px;height:22px;border-radius:50%;border:2px white solid;"></div>',
+          html: `<div style="background:${color};width:22px;height:22px;border-radius:50%;border:2px white solid;"></div>`,
           iconSize: [22, 22],
         }),
       });
-      marker.on("click", async () => {
-        await openPointPopup(marker, p, pointKey(p, idx));
-      });
+      marker.on("click", async () => { await openPointPopup(marker, p, pointKey(p, idx)); });
       pointsLayer.addLayer(marker);
       if (!bounds) bounds = L.latLngBounds(ll, ll);
       else bounds.extend(ll);
     }
 
-    for (let idx = maxInteractive; idx < points.length; idx += 1) {
-      const p = points[idx];
+    for (let idx = maxInteractive; idx < filtered.length; idx++) {
+      const p = filtered[idx];
       heat.push([p.lat, p.lon, 0.72]);
       if (!bounds) bounds = L.latLngBounds([p.lat, p.lon], [p.lat, p.lon]);
       else bounds.extend([p.lat, p.lon]);
@@ -707,19 +848,19 @@
     const summaryParams = buildClientParams("desc");
     const pointsParams = buildClientParams("desc");
     pointsParams.set("limit", "12000");
-    const placesParams = new URLSearchParams({
-      iin: state.iin,
-      period: state.filters.period,
-    });
+    const placesParams = new URLSearchParams({ iin: state.iin });
+
+    const journeyParams = new URLSearchParams({ iin: state.iin, period: state.filters.period });
     if (state.filters.period === "custom") {
-      if (state.filters.startDate) placesParams.set("start_date", state.filters.startDate);
-      if (state.filters.endDate) placesParams.set("end_date", state.filters.endDate);
+      if (state.filters.startDate) journeyParams.set("start_date", state.filters.startDate);
+      if (state.filters.endDate) journeyParams.set("end_date", state.filters.endDate);
     }
 
-    const [summary, points, places] = await Promise.all([
+    const [summary, points, places, journeyData] = await Promise.all([
       fetchJson(`/api/client/summary?${summaryParams.toString()}`),
       fetchJson(`/api/client/points?${pointsParams.toString()}`),
       fetchJson(`/api/client/places?${placesParams.toString()}`),
+      fetchJson(`/api/client/journey?${journeyParams.toString()}`).catch(() => ({ days: [] })),
     ]);
     state.points = points || [];
     state.places = places || [];
@@ -738,6 +879,9 @@
     renderTopRayons(summary.top_rayons || []);
     renderPlaces(state.places);
     renderMainPoints(state.points);
+    renderTransferBlock(summary.transfers);
+    clearJourneyLayer();
+    if (state.journeyOpen) renderJourney(journeyData.days || []);
     if (el.clientPanel) el.clientPanel.classList.remove("loading-shimmer");
     if (el.selectedAuthBlock) el.selectedAuthBlock.classList.add("hidden");
     renderRoute(state.points);
@@ -800,6 +944,49 @@
         renderRoute(state.points);
       });
     }
+
+    if (el.journeyToggleBtn) {
+      el.journeyToggleBtn.addEventListener("click", async () => {
+        state.journeyOpen = !state.journeyOpen;
+        el.journeyToggleBtn.classList.toggle("active", state.journeyOpen);
+        el.journeyToggleBtn.textContent = state.journeyOpen ? "📅 Закрыть" : "📅 По дням";
+        if (el.journeySection) el.journeySection.style.display = state.journeyOpen ? "" : "none";
+        if (state.journeyOpen) {
+          const journeyParams = new URLSearchParams({ iin: state.iin, period: state.filters.period });
+          if (state.filters.period === "custom") {
+            if (state.filters.startDate) journeyParams.set("start_date", state.filters.startDate);
+            if (state.filters.endDate) journeyParams.set("end_date", state.filters.endDate);
+          }
+          try {
+            const data = await fetchJson(`/api/client/journey?${journeyParams}`);
+            renderJourney(data.days || []);
+          } catch (e) { renderJourney([]); }
+        } else {
+          clearJourneyLayer();
+        }
+      });
+    }
+
+    if (el.journeyCloseBtn) {
+      el.journeyCloseBtn.addEventListener("click", () => {
+        state.journeyOpen = false;
+        if (el.journeyToggleBtn) { el.journeyToggleBtn.classList.remove("active"); el.journeyToggleBtn.textContent = "📅 По дням"; }
+        if (el.journeySection) el.journeySection.style.display = "none";
+        clearJourneyLayer();
+      });
+    }
+
+    function setPointFilter(mode) {
+      state.pointFilter = mode;
+      [["ptAll","all"],["ptTransfer","transfer"],["ptNoTransfer","notransfer"]].forEach(([id, m]) => {
+        if (el[id]) el[id].classList.toggle("active", m === mode);
+      });
+      renderMainPoints(state.points);
+    }
+
+    if (el.ptAll) el.ptAll.addEventListener("click", () => setPointFilter("all"));
+    if (el.ptTransfer) el.ptTransfer.addEventListener("click", () => setPointFilter("transfer"));
+    if (el.ptNoTransfer) el.ptNoTransfer.addEventListener("click", () => setPointFilter("notransfer"));
   }
 
   const params = new URLSearchParams(window.location.search);

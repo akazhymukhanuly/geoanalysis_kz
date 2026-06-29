@@ -9,6 +9,19 @@
   <link rel="stylesheet" href="/staticgeo/leaflet/leaflet.css" />
   <link rel="stylesheet" href="/staticgeo/leaflet/nouislider.min.css" />
   <link rel="stylesheet" href="/staticgeo/css/app.css?v=20260318" />
+  <style>
+    .journey-day { padding:6px 8px; border-radius:7px; margin-bottom:4px; cursor:pointer; font-size:12px; border:1px solid var(--line,rgba(0,0,0,.1)); transition:background .15s; }
+    .journey-day:hover { background:rgba(242,183,5,0.12); }
+    .journey-day.active { background:rgba(242,183,5,0.22); border-color:#f2b705; }
+    .journey-day-date { font-weight:700; }
+    .journey-day-meta { color:#697386; font-size:11px; }
+    .pt-seg { display:flex; gap:2px; background:var(--panel2,rgba(0,0,0,.06)); border-radius:8px; padding:2px; }
+    .pt-seg button { border:none; background:transparent; padding:3px 9px; border-radius:6px; font-size:12px; cursor:pointer; color:inherit; transition:background .15s; }
+    .pt-seg button.active { background:var(--panel,#fff); box-shadow:0 1px 3px rgba(0,0,0,.15); font-weight:700; }
+    .tr-bar { display:flex; align-items:center; gap:6px; font-size:11px; margin-bottom:3px; }
+    .tr-bar .bar-track { flex:1; height:5px; background:var(--line,rgba(0,0,0,.08)); border-radius:3px; overflow:hidden; }
+    .tr-bar .bar-fill { height:100%; border-radius:3px; }
+  </style>
 </head>
 <body>
   <div id="map"></div>
@@ -43,6 +56,14 @@
     </div>
     <button class="pill" id="pointPlayBtn" type="button" title="Показывать точки по очереди">▶ Точки</button>
     <button class="pill" id="routeToggleBtn" type="button" title="Показать маршрут">🗺 Маршрут</button>
+    <button class="pill" id="journeyToggleBtn" type="button" title="Маршрут по дням">📅 По дням</button>
+    <div class="pill" style="padding:3px 6px;">
+      <div class="pt-seg">
+        <button id="ptAll" class="active" type="button" title="Все авторизации">Все</button>
+        <button id="ptTransfer" type="button" title="С переводом">💳 Перевод</button>
+        <button id="ptNoTransfer" type="button" title="Без перевода">Без</button>
+      </div>
+    </div>
     <a href="/global">Общий вид</a>
   </div>
 
@@ -67,6 +88,24 @@
     <div class="mini-title">Вероятные места</div>
     <div id="clientInferredPlaces"></div>
 
+    <div id="transferBlock" style="display:none;margin-top:10px;padding:10px;background:var(--panel2);border-radius:10px;border:1px solid var(--line);">
+      <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:#0d9488;">💳 Переводы клиента</div>
+      <div class="stats-grid" style="margin-bottom:8px;">
+        <div class="stat"><div>Авт. с переводом</div><b id="trCount">0</b></div>
+        <div class="stat"><div>Конверсия</div><b id="trConvPct">0%</b></div>
+        <div class="stat"><div>Сумма KZT</div><b id="trTotalKzt">—</b></div>
+      </div>
+      <div id="trPurposeList"></div>
+    </div>
+
+    <div id="journeySection" style="display:none;">
+      <div class="mini-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <span>Маршрут по дням</span>
+        <button id="journeyCloseBtn" type="button" style="background:none;border:none;cursor:pointer;font-size:13px;color:var(--muted);">✕</button>
+      </div>
+      <div id="journeyDayList" style="max-height:280px;overflow-y:auto;"></div>
+    </div>
+
     <div id="selectedAuthBlock" class="hidden">
       <div class="mini-title">Выбранная авторизация</div>
       <div class="row-lite"><span>Время</span><b id="selAuthTime">-</b></div>
@@ -78,10 +117,10 @@
     <div id="clientMsg"></div>
   </div>
 
-  <script src="/staticgeo/leaflet/leaflet.js"></script>
-  <script src="/staticgeo/leaflet/leaflet-heat.js"></script>
-  <script src="/staticgeo/leaflet/nouislider.min.js"></script>
+  <script src="/staticgeo/leaflet/leaflet.js" charset="utf-8"></script>
+  <script src="/staticgeo/leaflet/leaflet-heat.js" charset="utf-8"></script>
+  <script src="/staticgeo/leaflet/nouislider.min.js" charset="utf-8"></script>
   <div id="chartTip"></div>
-  <script src="/staticgeo/js/client.js?v=20260318"></script>
+  <script src="/staticgeo/js/client.js?v=20260424" charset="utf-8"></script>
 </body>
 </html>

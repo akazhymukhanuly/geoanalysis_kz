@@ -1,6 +1,9 @@
 from __future__ import annotations
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -9,6 +12,7 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 CACHE_DIR = BASE_DIR / "map_cache"
 
 PARQUET_PATH = DATA_DIR / "clients_enriched.parquet"
+TRANSFERS_PARQUET_PATH = DATA_DIR / "transfers_enriched.parquet"
 KZ_GEOJSON_PATH = DATA_DIR / "Open_dataset_of_administrative_boundaries_of_Kazakhstan.geojson"
 INFRA_XLSX_PATH = DATA_DIR / "2gis_Full_Data_Rubrics.xlsx"
 INFRA_PARQUET_PATH = DATA_DIR / "infra_points.parquet"

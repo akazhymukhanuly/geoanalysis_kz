@@ -29,6 +29,7 @@ from config import (
     MAX_CACHE_ZOOM,
     MAX_SERVE_ZOOM,
     PARQUET_PATH,
+    TRANSFERS_PARQUET_PATH,
     PROXY_TILE_URL,
     STATIC_DIR,
     TEMPLATES_DIR,
@@ -54,6 +55,15 @@ async def _lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Geo Analytics", lifespan=_lifespan)
+
+@app.middleware("http")
+async def _add_charset(request, call_next):
+    response = await call_next(request)
+    ct = response.headers.get("content-type", "")
+    if "javascript" in ct and "charset" not in ct:
+        response.headers["content-type"] = ct + "; charset=utf-8"
+    return response
+
 app.mount("/staticgeo", StaticFiles(directory=str(STATIC_DIR)), name="staticgeo")
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -82,6 +92,8 @@ BUILD_BEFORE_RELOAD = os.getenv("BUILD_BEFORE_RELOAD", "1").strip().lower() in (
 SOURCE_QUERY = os.getenv("SOURCE_QUERY", "")
 LAST_BUILD_AT: Optional[str] = None
 LAST_BUILD_ERROR: Optional[str] = None
+TRANSFERS_HAS_TRANS_DATE = False
+HAS_SESSION_DATA = False  # True when clients parquet carries has_transfer columns
 
 
 def _sql_path(p: Path) -> str:
@@ -280,23 +292,36 @@ def _append_period_clause(
     params.extend([start.isoformat(), end.isoformat()])
 
 
+TRANSFERS_SOURCE_QUERY = os.getenv("TRANSFERS_QUERY", "")
+
+
 def _build_clients_parquet() -> None:
     global LAST_BUILD_AT, LAST_BUILD_ERROR
     db_url = CONFIG_DB_URL or os.getenv("DB_URL", "")
     if not db_url:
         print("[build] BUILD_BEFORE_RELOAD=1 but DB_URL is not set — skipping build", flush=True)
         return
-    query = SOURCE_QUERY or _build_module.DEFAULT_QUERY
-    print(f"[build] starting parquet build from DB", flush=True)
-    _build_module.run(
+
+    auth_query = SOURCE_QUERY or _build_module.DEFAULT_QUERY
+    transfers_query = TRANSFERS_SOURCE_QUERY or _build_module.DEFAULT_TRANSFERS_QUERY
+    session_transfers_query = _build_module.DEFAULT_SESSION_TRANSFERS_QUERY
+    window = _build_module.SESSION_WINDOW_MINUTES
+
+    print(f"[build] run_enriched: auth + transfers (session window ±{window} min)", flush=True)
+    _build_module.run_enriched(
         db_url=db_url,
-        query=query,
+        auth_query=auth_query,
+        transfers_query=transfers_query,
+        session_transfers_query=session_transfers_query,
         out_parquet=PARQUET_PATH,
+        transfers_parquet=TRANSFERS_PARQUET_PATH,
         geojson_path=KZ_GEOJSON_PATH,
+        window_minutes=window,
     )
+
     LAST_BUILD_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     LAST_BUILD_ERROR = None
-    print(f"[build] parquet build done at {LAST_BUILD_AT}", flush=True)
+    print(f"[build] enriched parquet build done at {LAST_BUILD_AT}", flush=True)
 
 
 def _reload_clients_table(reason: str = "manual") -> None:
@@ -310,8 +335,9 @@ def _reload_clients_table(reason: str = "manual") -> None:
                 print(f"[build] parquet build failed: {exc}; will reload existing parquet", flush=True)
         with _DB_WRITE_LOCK:
             _init_clients()
+            _init_transfers()
         LAST_CLIENT_RELOAD_AT = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[clients] reloaded from parquet ({reason}) at {LAST_CLIENT_RELOAD_AT}", flush=True)
+        print(f"[clients+transfers] reloaded from parquet ({reason}) at {LAST_CLIENT_RELOAD_AT}", flush=True)
 
 
 def _seconds_until_next_daily_run(hh: int, mm: int) -> float:
@@ -462,7 +488,7 @@ def _load_boundaries() -> None:
 
 
 def _init_clients() -> None:
-    global HAS_EVENT_DATE
+    global HAS_EVENT_DATE, HAS_SESSION_DATA
     if not PARQUET_PATH.exists():
         raise RuntimeError(f"Parquet not found: {PARQUET_PATH}. Build it first with make_test_parquet.py")
 
@@ -491,6 +517,11 @@ def _init_clients() -> None:
     rayon_name_col = _pick_col(columns, "rayon_name")
     device_type_col = _pick_col(columns, "device_type", "device_model", "platform", "os", "device_name")
     event_date_col = _pick_col(columns, "event_date", "date")
+    # Session-join columns (present only in enriched build)
+    has_tr_col = _pick_col(columns, "has_transfer")
+    sess_count_col = _pick_col(columns, "session_transfer_count")
+    sess_kzt_col = _pick_col(columns, "session_transfer_kzt")
+    sess_purpose_col = _pick_col(columns, "session_purpose_cat")
 
     if not lat_col or not lon_col:
         raise RuntimeError("lat/lon columns are required in clients parquet")
@@ -523,6 +554,12 @@ def _init_clients() -> None:
     else:
         event_date_expr = "NULL::DATE"
 
+    # Session-enrichment expressions (fallback to neutral values when column absent)
+    has_tr_expr = f"TRY_CAST({has_tr_col} AS BOOLEAN)" if has_tr_col else "FALSE"
+    sess_count_expr = f"COALESCE(TRY_CAST({sess_count_col} AS INTEGER), 0)" if sess_count_col else "0"
+    sess_kzt_expr = f"COALESCE(TRY_CAST({sess_kzt_col} AS DOUBLE), 0.0)" if sess_kzt_col else "0.0"
+    sess_purpose_expr = f"CAST({sess_purpose_col} AS VARCHAR)" if sess_purpose_col else "NULL::VARCHAR"
+
     for stmt in ["DROP VIEW clients;", "DROP TABLE clients;"]:
         try:
             con.execute(stmt)
@@ -541,13 +578,21 @@ def _init_clients() -> None:
       CAST({oblast_col} AS VARCHAR) AS oblast_kk,
       CAST({rayon_id_col} AS VARCHAR) AS rayon_id,
       {rayon_name_expr} AS rayon_name,
-      {device_type_expr} AS device_type
+      {device_type_expr} AS device_type,
+      COALESCE({has_tr_expr}, FALSE) AS has_transfer,
+      {sess_count_expr} AS session_transfer_count,
+      {sess_kzt_expr} AS session_transfer_kzt,
+      {sess_purpose_expr} AS session_purpose_cat
     FROM read_parquet('{parquet}')
     WHERE {lat_col} IS NOT NULL AND {lon_col} IS NOT NULL;
     """)
 
     non_null_dates = con.execute("SELECT COUNT(*) FROM clients WHERE event_date IS NOT NULL").fetchone()[0]
     HAS_EVENT_DATE = int(non_null_dates or 0) > 0
+
+    session_hits = con.execute("SELECT COUNT(*) FROM clients WHERE has_transfer").fetchone()[0]
+    HAS_SESSION_DATA = int(session_hits or 0) > 0
+    print(f"[clients] has_session_data={HAS_SESSION_DATA}  session_hits={session_hits:,}", flush=True)
 
 
 def _load_infra_points() -> None:
@@ -645,9 +690,134 @@ def _load_infra_points() -> None:
     print(f"[infra] loaded {len(INFRA_POINTS)} points from xlsx: {INFRA_XLSX_PATH}", flush=True)
 
 
+_PURPOSE_CAT_SQL = """
+    CASE
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%зарубеж%' THEN 'p2p_abroad'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%брокерск%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%invest%'   THEN 'invest'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%конвертац%' THEN 'conversion'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%открыт%'
+         AND lower(CAST({p} AS VARCHAR)) LIKE '%депозит%'  THEN 'deposit'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%iban%'     THEN 'iban_external'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%p2p%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%visa alias%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%номеру телефона%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%карты на карту%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%родительск%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%open api%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%cash by code%'
+          OR lower(CAST({p} AS VARCHAR)) LIKE '%возврат%'  THEN 'p2p_local'
+        WHEN lower(CAST({p} AS VARCHAR)) LIKE '%бюджет%'   THEN 'budget'
+        ELSE 'transfer'
+    END
+"""
+
+
+def _init_transfers() -> None:
+    global TRANSFERS_HAS_TRANS_DATE
+    if not TRANSFERS_PARQUET_PATH.exists():
+        print(f"[transfers] parquet not found: {TRANSFERS_PARQUET_PATH} — table will be empty", flush=True)
+        con.execute("DROP TABLE IF EXISTS transfers;")
+        con.execute("""
+            CREATE TABLE transfers (
+                lat DOUBLE, lon DOUBLE, iin VARCHAR, amount_kzt DOUBLE,
+                amount_cur DOUBLE, currency VARCHAR, direction VARCHAR,
+                purpose VARCHAR, purpose_cat VARCHAR, bank_commission DOUBLE,
+                partner_id VARCHAR, account VARCHAR, client_name VARCHAR,
+                trans_ts TIMESTAMP, trans_date VARCHAR, hour BIGINT,
+                oblast_kk VARCHAR, rayon_id VARCHAR, rayon_name VARCHAR
+            )
+        """)
+        TRANSFERS_HAS_TRANS_DATE = False
+        return
+
+    p = _sql_path(TRANSFERS_PARQUET_PATH)
+    cols_raw = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{p}') LIMIT 0").fetchall()
+    col_map = {row[0].lower(): row[0] for row in cols_raw}
+
+    def _pc(*candidates: str) -> str:
+        for c in candidates:
+            if c.lower() in col_map:
+                return col_map[c.lower()]
+        return candidates[0]
+
+    lat_c        = _pc("lat")
+    lon_c        = _pc("lon")
+    iin_c        = _pc("iin")
+    amtkzt_c     = _pc("amount_kzt")
+    amtcur_c     = _pc("amount_cur")
+    cur_c        = _pc("target_currency", "currency")
+    dir_c        = _pc("direction")
+    purp_c       = _pc("purpose")
+    ts_c         = _pc("trans_ts", "trans_date")
+    comm_c       = _pc("bank_commission", "commission")
+    partner_c    = _pc("partner_id", "partner")
+    account_c    = _pc("account")
+    cname_c      = _pc("client_name", "name")
+    oblast_c     = _pc("oblast_kk", "oblast")
+    rayon_id_c   = _pc("rayon_id")
+    rayon_name_c = _pc("rayon_name")
+
+    purpose_cat_expr = _PURPOSE_CAT_SQL.format(p=purp_c)
+
+    con.execute("DROP TABLE IF EXISTS transfers;")
+    con.execute(f"""
+    CREATE TABLE transfers AS
+    SELECT
+        TRY_CAST({lat_c}        AS DOUBLE)    AS lat,
+        TRY_CAST({lon_c}        AS DOUBLE)    AS lon,
+        CAST({iin_c}            AS VARCHAR)   AS iin,
+        TRY_CAST({amtkzt_c}     AS DOUBLE)    AS amount_kzt,
+        TRY_CAST({amtcur_c}     AS DOUBLE)    AS amount_cur,
+        CAST({cur_c}            AS VARCHAR)   AS currency,
+        CAST({dir_c}            AS VARCHAR)   AS direction,
+        CAST({purp_c}           AS VARCHAR)   AS purpose,
+        {purpose_cat_expr}                    AS purpose_cat,
+        TRY_CAST({comm_c}       AS DOUBLE)    AS bank_commission,
+        CAST({partner_c}        AS VARCHAR)   AS partner_id,
+        CAST({account_c}        AS VARCHAR)   AS account,
+        CAST({cname_c}          AS VARCHAR)   AS client_name,
+        TRY_CAST({ts_c}         AS TIMESTAMP) AS trans_ts,
+        CAST(TRY_CAST({ts_c}    AS DATE) AS VARCHAR) AS trans_date,
+        CAST(EXTRACT('hour' FROM TRY_CAST({ts_c} AS TIMESTAMP)) AS BIGINT) AS hour,
+        CAST({oblast_c}         AS VARCHAR)   AS oblast_kk,
+        CAST({rayon_id_c}       AS VARCHAR)   AS rayon_id,
+        CAST({rayon_name_c}     AS VARCHAR)   AS rayon_name
+    FROM read_parquet('{p}')
+    WHERE TRY_CAST({lat_c} AS DOUBLE) IS NOT NULL
+      AND TRY_CAST({lon_c} AS DOUBLE) IS NOT NULL
+    """)
+
+    cnt = con.execute("SELECT COUNT(*) FROM transfers").fetchone()[0]
+    non_null = con.execute("SELECT COUNT(*) FROM transfers WHERE trans_ts IS NOT NULL").fetchone()[0]
+    TRANSFERS_HAS_TRANS_DATE = int(non_null or 0) > 0
+    print(f"[transfers] loaded {cnt} rows, has_trans_date={TRANSFERS_HAS_TRANS_DATE}", flush=True)
+
+
+def _reload_transfers_table() -> None:
+    with _DB_WRITE_LOCK:
+        _init_transfers()
+
+
+def _append_transfers_period_clause(
+    where: list[str],
+    params: list,
+    period: str,
+    anchor_date: Optional[str],
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> None:
+    if not TRANSFERS_HAS_TRANS_DATE:
+        return
+    start, end = _period_bounds(period, anchor_date, start_date, end_date)
+    where.append("trans_ts BETWEEN ? AND ?")
+    params.extend([start.isoformat(), end.isoformat() + " 23:59:59"])
+
+
 def init_all() -> None:
     _load_boundaries()
     _reload_clients_table(reason="startup")
+    _reload_transfers_table()
     # Infra load is disabled by default to keep startup fully offline and fast.
     if ENABLE_INFRA:
         _load_infra_points()
@@ -724,6 +894,7 @@ async def global_page(request: Request):
 @app.get("/client")
 async def client_page(request: Request, iin: Optional[str] = None):
     return templates.TemplateResponse("client.html", {"request": request, "iin": iin or ""}, media_type="text/html; charset=utf-8")
+
 
 
 @app.get("/healthz")
@@ -902,9 +1073,33 @@ async def api_dashboard(
     else:
         total_rayons = len(RAYONS_BY_OBLAST.get(oblast, []))
 
+    # Session conversion (only when enriched parquet available)
+    session = None
+    if HAS_SESSION_DATA:
+        sess_row = con.execute(
+            f"""
+            SELECT
+                SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) AS tr_sessions,
+                COUNT(*) AS total_sessions,
+                COALESCE(SUM(session_transfer_kzt), 0) AS total_kzt
+            FROM clients WHERE {where_sql}
+            """,
+            params,
+        ).fetchone()
+        tr_sess = int(sess_row[0] or 0)
+        tot_sess = int(sess_row[1] or 0)
+        session = {
+            "transfer_sessions": tr_sess,
+            "total_sessions": tot_sess,
+            "conversion_pct": round(tr_sess * 100 / tot_sess, 1) if tot_sess else 0.0,
+            "total_transfer_kzt": float(sess_row[2] or 0),
+        }
+
     return {
         "period_used": period_label,
         "has_event_date": HAS_EVENT_DATE,
+        "has_session_data": HAS_SESSION_DATA,
+        "session": session,
         "kpi": {
             "events": int(kpi[0] or 0),
             "users": int(kpi[1] or 0),
@@ -948,6 +1143,7 @@ async def api_points(
     period: str = "week",
     anchor_date: Optional[str] = None,
     start_date: Optional[str] = None,
+    layer_mode: str = "all",
     end_date: Optional[str] = None,
 ):
     _ensure_ready()
@@ -995,6 +1191,10 @@ async def api_points(
         where_clause += " AND iin = ?"
         params.append(iin)
 
+    # --- Layer mode filter (auth-only vs all) ---
+    if layer_mode == "no_transfer":
+        where_clause += " AND (has_transfer IS NULL OR has_transfer = FALSE)"
+
     # --- Period filter ---
     period_where: list[str] = []
     period_params: list = []
@@ -1004,17 +1204,18 @@ async def api_points(
         params.extend(period_params)
 
     # --- Aggregation step selection ---
+    # Avoid ROUND(lat/step)*step grid centroids at mid zoom — they appear as visible squares.
+    # Switch to raw points early (zoom >= 11) so heatmap kernel blurs them naturally.
     if effective_rayon_id:
         step = None
     elif oblast and oblast != "ALL":
-        # For large datasets keep aggregation longer; raw points only on close zoom.
-        step = None if zoom >= 13 else 0.02
+        step = None if zoom >= 11 else 0.04
+    elif zoom < 7:
+        step = 0.4
     elif zoom < 9:
-        step = 0.25
+        step = 0.12
     elif zoom < 11:
-        step = 0.08
-    elif zoom < 13:
-        step = 0.03
+        step = 0.04
     else:
         step = None
 
@@ -1025,7 +1226,8 @@ async def api_points(
                 ROUND(lat/{step})*{step} AS lat,
                 ROUND(lon/{step})*{step} AS lon,
                 COUNT(*) AS count,
-                APPROX_COUNT_DISTINCT(iin) AS uniq
+                APPROX_COUNT_DISTINCT(iin) AS uniq,
+                SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) AS tr
             FROM clients
             WHERE {where_clause}
             GROUP BY lat, lon
@@ -1033,19 +1235,29 @@ async def api_points(
         """
         rows = con.execute(query, params).fetchall()
         return [
-            {"lat": float(r[0]), "lon": float(r[1]), "count": int(r[2]), "uniq": int(r[3])}
+            {"lat": float(r[0]), "lon": float(r[1]), "count": int(r[2]), "uniq": int(r[3]), "tr": int(r[4])}
             for r in rows
         ]
 
     # --- Raw points ---
     query = f"""
-        SELECT lat, lon, iin, hour
+        SELECT lat, lon, iin, hour,
+               has_transfer,
+               session_purpose_cat
         FROM clients
         WHERE {where_clause}
         LIMIT 30000
     """
     rows = con.execute(query, params).fetchall()
-    return [{"lat": float(r[0]), "lon": float(r[1]), "iin": r[2], "hour": int(r[3])} for r in rows]
+    return [
+        {
+            "lat": float(r[0]), "lon": float(r[1]),
+            "iin": r[2], "hour": int(r[3]),
+            "has_transfer": bool(r[4]),
+            "purpose_cat": r[5],
+        }
+        for r in rows
+    ]
 
 
 @app.get("/api/stats/rayon")
@@ -1200,6 +1412,28 @@ async def api_client_summary(
         if 0 <= h <= 23:
             hours[h] = int(count)
 
+    tr = con.execute(
+        f"""
+        SELECT
+            SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) AS tr_count,
+            COALESCE(SUM(session_transfer_kzt), 0) AS tr_kzt,
+            ROUND(SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 1) AS conv_pct
+        FROM clients WHERE {where_sql}
+        """,
+        params,
+    ).fetchone()
+
+    tr_purpose = con.execute(
+        f"""
+        SELECT session_purpose_cat, COUNT(*) AS cnt,
+               COALESCE(SUM(session_transfer_kzt), 0) AS vol
+        FROM clients
+        WHERE {where_sql} AND has_transfer AND session_purpose_cat IS NOT NULL
+        GROUP BY session_purpose_cat ORDER BY cnt DESC LIMIT 6
+        """,
+        params,
+    ).fetchall()
+
     return {
         "iin": iin,
         "events": int(totals[0] or 0),
@@ -1209,6 +1443,15 @@ async def api_client_summary(
         "unique_rayons": int(totals[4] or 0),
         "hours": hours,
         "top_rayons": [{"rayon_name": r[0], "oblast_kk": r[1], "events": int(r[2])} for r in top_rayons_rows],
+        "transfers": {
+            "count": int(tr[0] or 0),
+            "total_kzt": float(tr[1] or 0),
+            "conversion_pct": float(tr[2] or 0),
+            "by_purpose": [
+                {"purpose_cat": r[0], "count": int(r[1]), "volume_kzt": float(r[2])}
+                for r in tr_purpose
+            ],
+        },
     }
 
 
@@ -1239,7 +1482,8 @@ async def api_client_points(
 
     rows = con.execute(
         f"""
-        SELECT lat, lon, hour, event_ts, rayon_name, oblast_kk
+        SELECT lat, lon, hour, event_ts, rayon_name, oblast_kk,
+               has_transfer, session_transfer_kzt, session_purpose_cat
         FROM clients
         WHERE {where_sql}
         ORDER BY event_ts {order_sql} NULLS LAST
@@ -1255,6 +1499,9 @@ async def api_client_points(
             "event_ts": str(r[3]) if r[3] is not None else None,
             "rayon_name": r[4],
             "oblast_kk": r[5],
+            "has_transfer": bool(r[6]) if r[6] is not None else False,
+            "transfer_kzt": float(r[7]) if r[7] else 0.0,
+            "purpose_cat": r[8],
         }
         for r in rows
     ]
@@ -1263,20 +1510,12 @@ async def api_client_points(
 @app.get("/api/client/places")
 async def api_client_places(
     iin: str = Query(..., min_length=4),
-    period: str = "month",
-    anchor_date: Optional[str] = None,
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
 ):
     _ensure_ready()
 
-    where = ["iin = ?"]
-    params: list = [iin]
-    _append_period_clause(where, params, period, anchor_date, start_date, end_date)
-    where_sql = " AND ".join(where)
-
+    # Always use full dataset for place detection — period filter is intentionally ignored.
     rows = con.execute(
-        f"""
+        """
         SELECT
           ROUND(lat, 3) AS lat_bin,
           ROUND(lon, 3) AS lon_bin,
@@ -1298,13 +1537,13 @@ async def api_client_places(
           ) AS weekend_events,
           COUNT(DISTINCT COALESCE(event_date, CAST(event_ts AS DATE))) AS active_days
         FROM clients
-        WHERE {where_sql}
+        WHERE iin = ?
         GROUP BY lat_bin, lon_bin
         HAVING COUNT(*) >= 2
         ORDER BY events DESC
         LIMIT 120
         """,
-        params,
+        [iin],
     ).fetchall()
 
     if not rows:
@@ -1325,19 +1564,9 @@ async def api_client_places(
         weekend_ratio = weekend_events / events
         regularity = min(1.0, active_days / 20.0) if active_days > 0 else 0.0
 
-        # Heuristic labels with confidence.
-        # home: ночь + регулярность + выходные (дома в выходные — норма)
         home_score = 0.50 * night_ratio + 0.30 * regularity + 0.12 * weekend_ratio + 0.08 * (1.0 - work_ratio)
         work_score = 0.62 * work_ratio + 0.28 * regularity + 0.10 * (1.0 - weekend_ratio)
-        # hobby: нерегулярно + выходные + не ночью
         hobby_score = 0.55 * weekend_ratio + 0.35 * (1.0 - regularity) + 0.10 * (1.0 - night_ratio)
-        score_map = {
-            "home": home_score,
-            "work": work_score,
-            "hobby": hobby_score,
-        }
-        label = max(score_map, key=score_map.get)
-        confidence = max(0.05, min(0.99, score_map[label]))
 
         candidates.append(
             {
@@ -1348,42 +1577,220 @@ async def api_client_places(
                 "work_ratio": round(work_ratio, 4),
                 "night_ratio": round(night_ratio, 4),
                 "weekend_ratio": round(weekend_ratio, 4),
-                "label": label,
-                "confidence": round(confidence, 4),
+                "home_score": home_score,
+                "work_score": work_score,
+                "hobby_score": hobby_score,
             }
         )
 
-    # Keep strongest location per label, then add top frequent others.
-    best_by_label: dict[str, dict] = {}
-    for item in candidates:
-        key = item["label"]
-        prev = best_by_label.get(key)
-        if prev is None or item["confidence"] > prev["confidence"] or (
-            item["confidence"] == prev["confidence"] and item["events"] > prev["events"]
-        ):
-            best_by_label[key] = item
-
-    ordered = []
-    for key in ["home", "work", "hobby"]:
-        if key in best_by_label:
-            ordered.append(best_by_label[key])
-
     _DEDUP_M = 400
 
-    def _already_placed(lat: float, lon: float) -> bool:
-        return any(_haversine_m(lat, lon, p["lat"], p["lon"]) < _DEDUP_M for p in ordered)
+    def _near_any(lat: float, lon: float, placed: list) -> bool:
+        return any(_haversine_m(lat, lon, p["lat"], p["lon"]) < _DEDUP_M for p in placed)
 
-    rest = sorted(candidates, key=lambda x: (x["events"], x["confidence"]), reverse=True)
-    for item in rest:
-        if _already_placed(item["lat"], item["lon"]):
+    ordered: list[dict] = []
+
+    # Step 1: HOME — best home_score across all candidates.
+    for c in sorted(candidates, key=lambda x: x["home_score"], reverse=True):
+        best = dict(c)
+        best["label"] = "home"
+        best["confidence"] = round(max(0.05, min(0.99, c["home_score"])), 4)
+        ordered.append(best)
+        break
+
+    # Step 2: WORK — best work_score, must not be near HOME.
+    for c in sorted(candidates, key=lambda x: x["work_score"], reverse=True):
+        if _near_any(c["lat"], c["lon"], ordered):
             continue
-        item = dict(item)
+        best = dict(c)
+        best["label"] = "work"
+        best["confidence"] = round(max(0.05, min(0.99, c["work_score"])), 4)
+        ordered.append(best)
+        break
+
+    # Step 3: HOBBY — best hobby_score, must not be near HOME or WORK.
+    for c in sorted(candidates, key=lambda x: x["hobby_score"], reverse=True):
+        if _near_any(c["lat"], c["lon"], ordered):
+            continue
+        best = dict(c)
+        best["label"] = "hobby"
+        best["confidence"] = round(max(0.05, min(0.99, c["hobby_score"])), 4)
+        ordered.append(best)
+        break
+
+    # Step 4: FREQUENT — remaining locations not near any already placed.
+    for c in sorted(candidates, key=lambda x: x["events"], reverse=True):
+        if _near_any(c["lat"], c["lon"], ordered):
+            continue
+        item = dict(c)
         item["label"] = "frequent"
+        item["confidence"] = round(max(0.05, min(0.99, max(c["home_score"], c["work_score"], c["hobby_score"]))), 4)
         ordered.append(item)
         if len(ordered) >= 6:
             break
 
+    for item in ordered:
+        item.pop("home_score", None)
+        item.pop("work_score", None)
+        item.pop("hobby_score", None)
+
     return ordered[:6]
+
+
+@app.get("/api/transfers/points")
+async def api_transfers_points(
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+    zoom: int,
+    purpose_cats: Optional[str] = None,
+    metric: str = "count",
+    period: str = "month",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+    params: list = [min_lat, max_lat, min_lon, max_lon]
+    where = "lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?"
+
+    if purpose_cats:
+        cats = [c.strip() for c in purpose_cats.split(",") if c.strip()]
+        if cats:
+            placeholders = ",".join("?" * len(cats))
+            where += f" AND purpose_cat IN ({placeholders})"
+            params.extend(cats)
+
+    period_where: list[str] = []
+    period_params: list = []
+    _append_transfers_period_clause(period_where, period_params, period, anchor_date, start_date, end_date)
+    if period_where:
+        where += " AND " + " AND ".join(period_where)
+        params.extend(period_params)
+
+    weight_expr = "COALESCE(SUM(amount_kzt), COUNT(*))" if metric == "amount" else "COUNT(*)"
+
+    if zoom < 7:
+        step = 0.4
+    elif zoom < 9:
+        step = 0.12
+    elif zoom < 11:
+        step = 0.04
+    else:
+        step = None
+
+    if step is not None:
+        rows = con.execute(f"""
+            SELECT ROUND(lat/{step})*{step} AS lat,
+                   ROUND(lon/{step})*{step} AS lon,
+                   COUNT(*) AS cnt,
+                   COALESCE(SUM(amount_kzt), 0) AS vol
+            FROM transfers
+            WHERE {where}
+            GROUP BY 1, 2
+            LIMIT 15000
+        """, params).fetchall()
+        return [{"lat": float(r[0]), "lon": float(r[1]), "count": int(r[2]), "amount": float(r[3])} for r in rows]
+
+    rows = con.execute(f"""
+        SELECT lat, lon, amount_kzt, purpose_cat, trans_ts
+        FROM transfers
+        WHERE {where}
+        ORDER BY trans_ts DESC NULLS LAST
+        LIMIT 20000
+    """, params).fetchall()
+    return [
+        {"lat": float(r[0]), "lon": float(r[1]),
+         "amount": float(r[2]) if r[2] is not None else 0.0,
+         "purpose_cat": r[3],
+         "ts": str(r[4]) if r[4] else None}
+        for r in rows
+    ]
+
+
+@app.get("/api/transfers/dashboard")
+async def api_transfers_dashboard(
+    purpose_cats: Optional[str] = None,
+    oblast: str = "ALL",
+    period: str = "month",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+    where: list[str] = []
+    params: list = []
+
+    if purpose_cats:
+        cats = [c.strip() for c in purpose_cats.split(",") if c.strip()]
+        if cats:
+            placeholders = ",".join("?" * len(cats))
+            where.append(f"purpose_cat IN ({placeholders})")
+            params.extend(cats)
+
+    if oblast and oblast != "ALL":
+        where.append("oblast_kk = ?")
+        params.append(oblast)
+
+    _append_transfers_period_clause(where, params, period, anchor_date, start_date, end_date)
+    where_sql = (" AND ".join(where)) if where else "1=1"
+
+    kpi = con.execute(f"""
+        SELECT COUNT(*) AS cnt,
+               COALESCE(SUM(amount_kzt), 0) AS vol,
+               COALESCE(AVG(amount_kzt), 0) AS avg_amt,
+               APPROX_COUNT_DISTINCT(iin) AS users
+        FROM transfers WHERE {where_sql}
+    """, params).fetchone()
+
+    purpose_rows = con.execute(f"""
+        SELECT purpose_cat, COUNT(*) AS cnt, COALESCE(SUM(amount_kzt), 0) AS vol
+        FROM transfers WHERE {where_sql}
+        GROUP BY purpose_cat ORDER BY vol DESC
+    """, params).fetchall()
+
+    hour_rows = con.execute(f"""
+        SELECT hour, COUNT(*) AS cnt
+        FROM transfers WHERE {where_sql} AND hour IS NOT NULL
+        GROUP BY hour ORDER BY hour
+    """, params).fetchall()
+    hours = [0] * 24
+    for hr, cnt in hour_rows:
+        h = int(hr or 0)
+        if 0 <= h <= 23:
+            hours[h] = int(cnt or 0)
+
+    top_rayon_rows = con.execute(f"""
+        SELECT rayon_id, COALESCE(MAX(rayon_name), rayon_id) AS rayon_name,
+               COALESCE(MAX(oblast_kk), '-') AS oblast_kk,
+               COUNT(*) AS cnt, COALESCE(SUM(amount_kzt), 0) AS vol
+        FROM transfers
+        WHERE {where_sql} AND rayon_id IS NOT NULL
+        GROUP BY rayon_id ORDER BY vol DESC LIMIT 8
+    """, params).fetchall()
+
+    return {
+        "has_trans_date": TRANSFERS_HAS_TRANS_DATE,
+        "kpi": {
+            "count": int(kpi[0] or 0),
+            "volume_kzt": float(kpi[1] or 0),
+            "avg_kzt": float(kpi[2] or 0),
+            "users": int(kpi[3] or 0),
+        },
+        "by_purpose": [
+            {"purpose_cat": r[0], "count": int(r[1]), "volume_kzt": float(r[2])}
+            for r in purpose_rows
+        ],
+        "hours": hours,
+        "top_rayons": [
+            {"rayon_id": r[0], "rayon_name": r[1], "oblast_kk": r[2],
+             "count": int(r[3]), "volume_kzt": float(r[4])}
+            for r in top_rayon_rows
+        ],
+    }
+
+
 
 
 @app.get("/api/infrastructure/nearby")
@@ -1682,6 +2089,383 @@ async def api_stats_choropleth(
     return {str(r[0]): {"events": int(r[1]), "users": int(r[2])} for r in rows}
 
 
+@app.get("/api/stats/period_compare")
+async def api_stats_period_compare(
+    oblast: str = "ALL",
+    period: str = "week",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+    if not HAS_EVENT_DATE:
+        return {"available": False}
+
+    cur_start, cur_end = _period_bounds(period, anchor_date, start_date, end_date)
+    duration = (cur_end - cur_start).days + 1
+    prev_end = cur_start - timedelta(days=1)
+    prev_start = prev_end - timedelta(days=duration - 1)
+
+    where_base: list[str] = []
+    params_base: list = []
+    if oblast and oblast != "ALL":
+        where_base.append("oblast_kk = ?")
+        params_base.append(oblast)
+
+    def _daily(s: date, e: date):
+        w = list(where_base) + ["event_date BETWEEN ? AND ?"]
+        p = list(params_base) + [s.isoformat(), e.isoformat()]
+        where_sql = " AND ".join(w) if w else "1=1"
+        rows = con.execute(
+            f"SELECT event_date, COUNT(*) AS events, APPROX_COUNT_DISTINCT(iin) AS users FROM clients WHERE {where_sql} GROUP BY event_date ORDER BY event_date",
+            p,
+        ).fetchall()
+        return {str(r[0]): {"events": int(r[1]), "users": int(r[2])} for r in rows}
+
+    cur_data = _daily(cur_start, cur_end)
+    prev_data = _daily(prev_start, prev_end)
+
+    cur_days = []
+    prev_days = []
+    for i in range(duration):
+        cd = (cur_start + timedelta(days=i)).isoformat()
+        pd = (prev_start + timedelta(days=i)).isoformat()
+        cur_days.append({"date": cd, **cur_data.get(cd, {"events": 0, "users": 0})})
+        prev_days.append({"date": pd, **prev_data.get(pd, {"events": 0, "users": 0})})
+
+    return {
+        "available": True,
+        "current": cur_days,
+        "previous": prev_days,
+        "cur_range": f"{cur_start.isoformat()}..{cur_end.isoformat()}",
+        "prev_range": f"{prev_start.isoformat()}..{prev_end.isoformat()}",
+    }
+
+
+@app.get("/api/stats/anomalies")
+async def api_stats_anomalies(
+    oblast: str = "ALL",
+    period: str = "week",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+    if not HAS_EVENT_DATE:
+        return {"available": False, "anomalies": []}
+
+    where: list[str] = []
+    params: list = []
+    if oblast and oblast != "ALL":
+        where.append("oblast_kk = ?")
+        params.append(oblast)
+
+    period_where: list[str] = []
+    period_params: list = []
+    _append_period_clause(period_where, period_params, period, anchor_date, start_date, end_date)
+    where.extend(period_where)
+    params.extend(period_params)
+    where_sql = (" AND ".join(where)) if where else "1=1"
+
+    rows = con.execute(
+        f"""
+        SELECT
+            rayon_id,
+            COALESCE(MAX(rayon_name), rayon_id) AS rayon_name,
+            COALESCE(MAX(oblast_kk), '-') AS oblast_kk,
+            COUNT(*) AS events,
+            APPROX_COUNT_DISTINCT(iin) AS users,
+            AVG(CAST(hour AS DOUBLE)) AS avg_hour,
+            STDDEV(CAST(hour AS DOUBLE)) AS std_hour,
+            SUM(CASE WHEN hour < 6 OR hour >= 22 THEN 1 ELSE 0 END) AS night_events
+        FROM clients
+        WHERE {where_sql} AND rayon_id IS NOT NULL
+        GROUP BY rayon_id
+        HAVING COUNT(*) >= 5
+        ORDER BY events DESC
+        """,
+        params,
+    ).fetchall()
+
+    if len(rows) < 3:
+        return {"available": True, "anomalies": []}
+
+    import statistics as _stats
+    events_list = [int(r[3]) for r in rows]
+    mean_ev = _stats.mean(events_list)
+    std_ev = _stats.stdev(events_list) if len(events_list) > 1 else 0
+
+    anomalies = []
+    for r in rows:
+        rayon_id, rayon_name, oblast_kk, events, users, avg_hour, _, night_events = r
+        events = int(events)
+        users = int(users)
+        night_events = int(night_events or 0)
+        night_pct = night_events / events if events > 0 else 0
+
+        reasons = []
+        severity = "normal"
+
+        if std_ev > 0:
+            z = (events - mean_ev) / std_ev
+            if z > 2.0:
+                reasons.append(f"Всплеск активности: +{round(z, 1)}σ выше среднего")
+                severity = "high"
+            elif z > 1.5:
+                reasons.append(f"Повышенная активность: +{round(z, 1)}σ")
+                severity = "medium"
+
+        if night_pct > 0.30:
+            reasons.append(f"Ночные авторизации: {round(night_pct * 100)}% событий с 22:00 до 06:00")
+            if severity == "normal":
+                severity = "medium"
+
+        if avg_hour is not None:
+            ah = float(avg_hour)
+            if ah < 7.0:
+                reasons.append(f"Аномально раннее время: ср. {round(ah, 1)}ч")
+                if severity == "normal":
+                    severity = "medium"
+            elif ah > 21.0:
+                reasons.append(f"Аномально позднее время: ср. {round(ah, 1)}ч")
+                if severity == "normal":
+                    severity = "medium"
+
+        if reasons:
+            anomalies.append({
+                "rayon_id": str(rayon_id),
+                "rayon_name": str(rayon_name),
+                "oblast_kk": str(oblast_kk),
+                "events": events,
+                "users": users,
+                "night_pct": round(night_pct * 100, 1),
+                "avg_hour": round(float(avg_hour), 1) if avg_hour is not None else None,
+                "severity": severity,
+                "reasons": reasons,
+            })
+
+    anomalies.sort(key=lambda x: (0 if x["severity"] == "high" else 1, -x["events"]))
+    return {"available": True, "anomalies": anomalies[:20]}
+
+
+@app.get("/api/stats/behavior_clusters")
+async def api_stats_behavior_clusters(
+    oblast: str = "ALL",
+    period: str = "week",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+
+    where: list[str] = []
+    params: list = []
+    if oblast and oblast != "ALL":
+        where.append("oblast_kk = ?")
+        params.append(oblast)
+
+    period_where: list[str] = []
+    period_params: list = []
+    _append_period_clause(period_where, period_params, period, anchor_date, start_date, end_date)
+    where.extend(period_where)
+    params.extend(period_params)
+    where_sql = (" AND ".join(where)) if where else "1=1"
+
+    rows = con.execute(
+        f"""
+        SELECT
+            rayon_id,
+            COALESCE(MAX(rayon_name), rayon_id) AS rayon_name,
+            COALESCE(MAX(oblast_kk), '-') AS oblast_kk,
+            COUNT(*) AS events,
+            APPROX_COUNT_DISTINCT(iin) AS users,
+            SUM(CASE WHEN hour BETWEEN 9 AND 18 THEN 1 ELSE 0 END) AS work_events,
+            SUM(CASE WHEN hour >= 22 OR hour < 6 THEN 1 ELSE 0 END) AS night_events,
+            SUM(CASE WHEN hour BETWEEN 6 AND 9 OR hour BETWEEN 17 AND 20 THEN 1 ELSE 0 END) AS transit_events
+        FROM clients
+        WHERE {where_sql} AND rayon_id IS NOT NULL
+        GROUP BY rayon_id
+        HAVING COUNT(*) >= 3
+        """,
+        params,
+    ).fetchall()
+
+    result = {}
+    for r in rows:
+        rayon_id, rayon_name, oblast_kk, events, users, work_ev, night_ev, transit_ev = r
+        events = int(events)
+        work_r = int(work_ev or 0) / events
+        night_r = int(night_ev or 0) / events
+        transit_r = int(transit_ev or 0) / events
+
+        if work_r >= 0.45:
+            pattern = "work"
+        elif night_r >= 0.25:
+            pattern = "home"
+        elif transit_r >= 0.30:
+            pattern = "transit"
+        else:
+            pattern = "mixed"
+
+        result[str(rayon_id)] = {
+            "rayon_name": str(rayon_name),
+            "oblast_kk": str(oblast_kk),
+            "events": events,
+            "users": int(users),
+            "work_pct": round(work_r * 100, 1),
+            "night_pct": round(night_r * 100, 1),
+            "transit_pct": round(transit_r * 100, 1),
+            "pattern": pattern,
+        }
+
+    return result
+
+
+@app.get("/api/stats/behavior_grid")
+async def api_stats_behavior_grid(
+    oblast: str = "ALL",
+    period: str = "week",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    step: float = 0.02,
+):
+    _ensure_ready()
+    step = max(0.005, min(0.1, float(step)))
+
+    where: list[str] = []
+    params: list = []
+    if oblast and oblast != "ALL":
+        where.append("oblast_kk = ?")
+        params.append(oblast)
+
+    period_where: list[str] = []
+    period_params: list = []
+    _append_period_clause(period_where, period_params, period, anchor_date, start_date, end_date)
+    where.extend(period_where)
+    params.extend(period_params)
+    where_sql = (" AND ".join(where)) if where else "1=1"
+
+    rows = con.execute(
+        f"""
+        SELECT
+            ROUND(lat/{step})*{step} AS lat_bin,
+            ROUND(lon/{step})*{step} AS lon_bin,
+            COUNT(*) AS events,
+            SUM(CASE WHEN hour BETWEEN 9 AND 18 THEN 1 ELSE 0 END) AS work_ev,
+            SUM(CASE WHEN hour >= 22 OR hour < 6 THEN 1 ELSE 0 END) AS night_ev,
+            SUM(CASE WHEN hour BETWEEN 6 AND 9 OR hour BETWEEN 17 AND 20 THEN 1 ELSE 0 END) AS transit_ev
+        FROM clients
+        WHERE {where_sql}
+        GROUP BY lat_bin, lon_bin
+        HAVING COUNT(*) >= 3
+        LIMIT 8000
+        """,
+        params,
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    # Compute per-cell ratios first, then classify relative to the mean.
+    # Fixed thresholds don't work for banking data where work hours dominate
+    # everywhere — relative scoring finds cells that are distinctively
+    # residential/transit compared to the oblast average.
+    cells = []
+    for r in rows:
+        lat_bin, lon_bin, events, work_ev, night_ev, transit_ev = r
+        events = int(events)
+        cells.append({
+            "lat": round(float(lat_bin), 4),
+            "lon": round(float(lon_bin), 4),
+            "events": events,
+            "work_r": int(work_ev or 0) / events,
+            "night_r": int(night_ev or 0) / events,
+            "transit_r": int(transit_ev or 0) / events,
+        })
+
+    mean_work = sum(c["work_r"] for c in cells) / len(cells)
+    mean_night = sum(c["night_r"] for c in cells) / len(cells)
+    mean_transit = sum(c["transit_r"] for c in cells) / len(cells)
+
+    result = []
+    for c in cells:
+        work_r, night_r, transit_r = c["work_r"], c["night_r"], c["transit_r"]
+        work_score = work_r - mean_work
+        night_score = night_r - mean_night
+        transit_score = transit_r - mean_transit
+
+        scores = {"work": work_score, "home": night_score, "transit": transit_score}
+        best = max(scores, key=scores.get)
+        pattern = best if scores[best] > 0.01 else "mixed"
+
+        result.append({
+            "lat": c["lat"],
+            "lon": c["lon"],
+            "events": c["events"],
+            "work_pct": round(work_r * 100, 1),
+            "night_pct": round(night_r * 100, 1),
+            "transit_pct": round(transit_r * 100, 1),
+            "pattern": pattern,
+        })
+
+    return result
+
+
+@app.get("/api/client/journey")
+async def api_client_journey(
+    iin: str = Query(..., min_length=4),
+    period: str = "month",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    _ensure_ready()
+
+    where = ["iin = ?"]
+    params: list = [iin]
+    _append_period_clause(where, params, period, anchor_date, start_date, end_date)
+    where_sql = " AND ".join(where)
+
+    rows = con.execute(
+        f"""
+        SELECT event_date, event_ts, lat, lon, hour, rayon_name, oblast_kk
+        FROM clients
+        WHERE {where_sql} AND event_ts IS NOT NULL
+        ORDER BY event_ts ASC
+        LIMIT 10000
+        """,
+        params,
+    ).fetchall()
+
+    days: dict[str, list] = {}
+    for r in rows:
+        event_date, event_ts, lat, lon, hour, rayon_name, oblast_kk = r
+        day_key = str(event_date) if event_date else (str(event_ts)[:10] if event_ts else None)
+        if not day_key:
+            continue
+        days.setdefault(day_key, []).append({
+            "lat": float(lat),
+            "lon": float(lon),
+            "hour": int(hour),
+            "event_ts": str(event_ts) if event_ts else None,
+            "rayon_name": str(rayon_name) if rayon_name else None,
+            "oblast_kk": str(oblast_kk) if oblast_kk else None,
+        })
+
+    result = []
+    for day_key in sorted(days.keys()):
+        pts = days[day_key]
+        result.append({
+            "date": day_key,
+            "events": len(pts),
+            "rayons": list({p["rayon_name"] for p in pts if p["rayon_name"]}),
+            "points": pts,
+        })
+
+    return {"iin": iin, "days": result, "total_days": len(result)}
+
+
 @app.get("/api/stats/devices")
 async def api_stats_devices(
     oblast: str = "ALL",
@@ -1757,6 +2541,85 @@ async def api_stats_devices(
     return {"available": True, "items": items}
 
 
+@app.get("/api/stats/conversion")
+async def api_stats_conversion(
+    oblast: str = "ALL",
+    period: str = "week",
+    anchor_date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    top_n: int = 20,
+):
+    """
+    Conversion funnel: for each rayon shows how many auth sessions led to a transfer.
+    Only available when the parquet was built with run_enriched (has_transfer column).
+    """
+    _ensure_ready()
+    if not HAS_SESSION_DATA:
+        return {"available": False, "reason": "Parquet built without session join. Re-run build with run_enriched."}
+
+    start, end = _period_bounds(period, anchor_date, start_date, end_date)
+    where_parts = ["event_date BETWEEN ? AND ?"]
+    params: list = [start.isoformat(), end.isoformat()]
+    if oblast and oblast != "ALL":
+        where_parts.append("oblast_kk = ?")
+        params.append(oblast)
+    where_sql = " AND ".join(where_parts)
+
+    rows = con.execute(
+        f"""
+        SELECT
+            rayon_id,
+            ANY_VALUE(rayon_name) AS rayon_name,
+            ANY_VALUE(oblast_kk) AS oblast_kk,
+            COUNT(*) AS total_sessions,
+            SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) AS transfer_sessions,
+            ROUND(SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0), 1) AS conversion_pct,
+            APPROX_COUNT_DISTINCT(iin) AS unique_users,
+            COALESCE(SUM(session_transfer_kzt), 0) AS total_transfer_kzt,
+            COALESCE(AVG(CASE WHEN has_transfer THEN session_transfer_kzt END), 0) AS avg_transfer_kzt
+        FROM clients
+        WHERE {where_sql} AND rayon_id IS NOT NULL
+        GROUP BY rayon_id
+        ORDER BY transfer_sessions DESC
+        LIMIT ?
+        """,
+        params + [top_n],
+    ).fetchall()
+
+    total_sessions_all = con.execute(
+        f"SELECT COUNT(*), SUM(CASE WHEN has_transfer THEN 1 ELSE 0 END) FROM clients WHERE {where_sql}",
+        params,
+    ).fetchone()
+    total_all = int(total_sessions_all[0] or 0)
+    transfer_all = int(total_sessions_all[1] or 0)
+
+    return {
+        "available": True,
+        "period": f"{start} / {end}",
+        "summary": {
+            "total_sessions": total_all,
+            "transfer_sessions": transfer_all,
+            "conversion_pct": round(transfer_all * 100 / total_all, 1) if total_all else 0.0,
+        },
+        "by_rayon": [
+            {
+                "rayon_id": r[0],
+                "rayon_name": r[1],
+                "oblast_kk": r[2],
+                "total_sessions": int(r[3] or 0),
+                "transfer_sessions": int(r[4] or 0),
+                "conversion_pct": float(r[5] or 0),
+                "unique_users": int(r[6] or 0),
+                "total_transfer_kzt": float(r[7] or 0),
+                "avg_transfer_kzt": float(r[8] or 0),
+            }
+            for r in rows
+        ],
+    }
+
+
+9
 if __name__ == "__main__":
     import uvicorn
 

@@ -43,13 +43,38 @@
     dbUsersDelta: document.getElementById("dbUsersDelta"),
     dowHourChart: document.getElementById("dowHourChart"),
     chartToggleBtn: document.getElementById("chartToggleBtn"),
-    devicesTitle: document.getElementById("devicesTitle"),
-    devicesList: document.getElementById("devicesList"),
     showChoropleth: document.getElementById("showChoropleth"),
+    showBehavior: document.getElementById("showBehavior"),
     darkModeBtn: document.getElementById("darkModeBtn"),
     dbCoverage: document.getElementById("dbCoverage"),
     rayonSearch: document.getElementById("rayonSearch"),
     choroplethLegend: document.getElementById("choroplethLegend"),
+    behaviorLegend: document.getElementById("behaviorLegend"),
+    compareSection: document.getElementById("compareSection"),
+    compareCanvas: document.getElementById("compareChart"),
+    compareLegend: document.getElementById("compareLegend"),
+    anomalySection: document.getElementById("anomalySection"),
+    anomalyList: document.getElementById("anomalyList"),
+    anomalyCount: document.getElementById("anomalyCount"),
+    layerAuth: document.getElementById("layerAuth"),
+    layerTransfer: document.getElementById("layerTransfer"),
+    layerBoth: document.getElementById("layerBoth"),
+    purposeFilterPill: document.getElementById("purposeFilterPill"),
+    purposeSelect: document.getElementById("purposeSelect"),
+    dbTrCountCard: document.getElementById("dbTrCountCard"),
+    dbTrVolCard: document.getElementById("dbTrVolCard"),
+    dbTrAvgCard: document.getElementById("dbTrAvgCard"),
+    dbTrUsersCard: document.getElementById("dbTrUsersCard"),
+    dbTrCount: document.getElementById("dbTrCount"),
+    dbTrVol: document.getElementById("dbTrVol"),
+    dbTrAvg: document.getElementById("dbTrAvg"),
+    dbTrUsers: document.getElementById("dbTrUsers"),
+    transferStatsSection: document.getElementById("transferStatsSection"),
+    kpiTrCount: document.getElementById("kpiTrCount"),
+    kpiTrVol: document.getElementById("kpiTrVol"),
+    kpiTrAvg: document.getElementById("kpiTrAvg"),
+    kpiTrConv: document.getElementById("kpiTrConv"),
+    purposeBreakdown: document.getElementById("purposeBreakdown"),
   };
 
   const state = {
@@ -81,6 +106,14 @@
     choroplethEnabled: false,
     anomalyRayons: new Set(),
     darkMode: false,
+    behaviorEnabled: false,
+    behaviorData: {},
+    anomalyLayer: null,
+    behaviorGridLayer: null,
+    transferLayer: null,
+    layerMode: "both",
+    transferHeatLayer: null,
+    transferDash: null,
   };
 
   const map = L.map("map", {
@@ -101,6 +134,13 @@
   map.getPane("oblastPane").style.zIndex = 410;
   map.createPane("rayonPane");
   map.getPane("rayonPane").style.zIndex = 420;
+  map.getPane("rayonPane").style.pointerEvents = "auto";
+
+  // Persistent renderers — created once, reused across oblast switches.
+  // Creating a new L.canvas() each time leaves orphaned map event listeners
+  // that conflict with the new renderer and break rayon hover/click detection.
+  const _oblastRenderer = L.canvas({ pane: "oblastPane" });
+  const _rayonRenderer  = L.canvas({ pane: "rayonPane" });
 
   L.tileLayer("/tiles/{z}/{x}/{y}.png", {
     minZoom: 5,
@@ -321,6 +361,7 @@
         lyr.bindTooltip(tip, { sticky: true });
       });
       renderChoroplethLegend(maxVal);
+      refreshDetailTop();
     } catch (e) {
       console.warn("[choropleth]", e);
     }
@@ -597,20 +638,300 @@
     return rows.map(p => [p.lat, p.lon, p.count !== undefined ? Math.min(5, 0.2 + Math.log(p.count + 1)) : 0.7]);
   }
 
+  // ---- Period Comparison Chart ----
+  function drawCompareChart(canvas, curDays, prevDays) {
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.clientWidth || 260;
+    const h = canvas.clientHeight || 80;
+    canvas.width = Math.floor(w * devicePixelRatio);
+    canvas.height = Math.floor(h * devicePixelRatio);
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    const n = Math.max(curDays.length, 1);
+    const padL = 6, padR = 6, padT = 6, padB = 18;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const slotW = plotW / n;
+    const barW = Math.max(2, Math.floor((slotW - 3) / 2));
+    const allVals = [...curDays.map(d => d.events), ...prevDays.map(d => d.events)];
+    const maxV = Math.max(1, ...allVals);
+
+    canvas.__cmpMeta = { padL, padT, plotW, plotH, slotW, barW, curDays, prevDays, maxV, n };
+
+    for (let i = 0; i < n; i++) {
+      const cur = curDays[i]?.events || 0;
+      const prev = prevDays[i]?.events || 0;
+      const x = padL + i * slotW;
+      const bh_cur = Math.round((cur / maxV) * plotH);
+      ctx.fillStyle = "rgba(211,47,47,0.85)";
+      ctx.fillRect(x + 1, padT + plotH - bh_cur, barW, Math.max(1, bh_cur));
+      const bh_prev = Math.round((prev / maxV) * plotH);
+      ctx.fillStyle = "rgba(100,116,139,0.55)";
+      ctx.fillRect(x + barW + 2, padT + plotH - bh_prev, barW, Math.max(1, bh_prev));
+    }
+
+    ctx.fillStyle = "#697386";
+    ctx.font = `${Math.max(7, Math.floor(Math.min(slotW, 10)))}px Segoe UI,Arial,sans-serif`;
+    ctx.textAlign = "center";
+    const step = Math.max(1, Math.round(n / 7));
+    for (let i = 0; i < n; i += step) {
+      const d = curDays[i]?.date || "";
+      ctx.fillText(d.slice(5), padL + i * slotW + slotW / 2, h - 3);
+    }
+  }
+
+  if (el.compareCanvas) {
+    el.compareCanvas.addEventListener("mousemove", (ev) => {
+      const m = el.compareCanvas.__cmpMeta;
+      if (!m) return;
+      const r = el.compareCanvas.getBoundingClientRect();
+      const x = ev.clientX - r.left - m.padL;
+      if (x < 0 || x > m.plotW) { hideTip(); return; }
+      const i = Math.max(0, Math.min(m.n - 1, Math.floor(x / m.slotW)));
+      const cur = m.curDays[i] || {};
+      const prev = m.prevDays[i] || {};
+      showTip(ev.clientX, ev.clientY,
+        `<div><b>${cur.date || ""}</b></div>
+         <div><span style="color:#d32f2f;">▮ Текущий:</span> <b>${(cur.events || 0).toLocaleString()}</b></div>
+         <div><span style="color:#64748b;">▮ Предыдущий: ${prev.date || ""}</span> <b>${(prev.events || 0).toLocaleString()}</b></div>`
+      );
+    });
+    el.compareCanvas.addEventListener("mouseleave", hideTip);
+  }
+
+  async function loadPeriodCompare() {
+    const { oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+    try {
+      const q = new URLSearchParams({ oblast, period });
+      if (anchorDate) q.set("anchor_date", anchorDate);
+      if (period === "custom") {
+        if (startDate) q.set("start_date", startDate);
+        if (endDate) q.set("end_date", endDate);
+      }
+      const data = await fetchJson(`/api/stats/period_compare?${q}`);
+      if (!data.available) { if (el.compareSection) el.compareSection.style.display = "none"; return; }
+      if (el.compareSection) el.compareSection.style.display = "";
+      if (el.compareLegend) {
+        el.compareLegend.innerHTML =
+          `<span class="cmp-cur">▮ ${data.cur_range}</span><span class="cmp-prev">▮ ${data.prev_range}</span>`;
+      }
+      setTimeout(() => drawCompareChart(el.compareCanvas, data.current, data.previous), 30);
+    } catch (e) {
+      if (el.compareSection) el.compareSection.style.display = "none";
+    }
+  }
+
+  // ---- Anomalies ----
+  async function loadAnomalies() {
+    if (!el.anomalySection || !el.anomalyList) return;
+    const { oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+    try {
+      const q = new URLSearchParams({ oblast, period });
+      if (anchorDate) q.set("anchor_date", anchorDate);
+      if (period === "custom") {
+        if (startDate) q.set("start_date", startDate);
+        if (endDate) q.set("end_date", endDate);
+      }
+      const data = await fetchJson(`/api/stats/anomalies?${q}`);
+      if (state.anomalyLayer) { try { map.removeLayer(state.anomalyLayer); } catch (_) {} state.anomalyLayer = null; }
+      if (!data.available || !data.anomalies?.length) {
+        el.anomalySection.style.display = "none";
+        return;
+      }
+      el.anomalySection.style.display = "";
+      if (el.anomalyCount) el.anomalyCount.textContent = `(${data.anomalies.length})`;
+      el.anomalyList.innerHTML = "";
+
+      const markerGroup = L.layerGroup().addTo(map);
+      state.anomalyLayer = markerGroup;
+      const anomalyIds = new Set(data.anomalies.map(a => a.rayon_id));
+
+      if (state.detailLayer) {
+        state.detailLayer.eachLayer(lyr => {
+          const fid = lyr.feature?.properties?.full_id;
+          if (!anomalyIds.has(fid)) return;
+          const a = data.anomalies.find(x => x.rayon_id === fid);
+          if (!a) return;
+          const isHigh = a.severity === "high";
+          if (!state.choroplethEnabled && !state.behaviorEnabled) {
+            lyr.setStyle({ color: isHigh ? "#ef4444" : "#f59e0b", weight: isHigh ? 3 : 2, fillColor: isHigh ? "#fca5a5" : "#fde68a", fillOpacity: 0.3 });
+          }
+          try {
+            const center = lyr.getBounds().getCenter();
+            L.circleMarker([center.lat, center.lng], {
+              radius: isHigh ? 11 : 8, color: isHigh ? "#ef4444" : "#f59e0b", weight: 2,
+              fillColor: isHigh ? "#ef4444" : "#f59e0b", fillOpacity: 0.75,
+            }).bindTooltip(`⚠ ${a.rayon_name}: ${a.reasons[0]}`, { sticky: true }).addTo(markerGroup);
+          } catch (_) {}
+        });
+      }
+
+      data.anomalies.forEach(a => {
+        const isHigh = a.severity === "high";
+        const d = document.createElement("div");
+        d.className = "anomaly-item " + (isHigh ? "anomaly-high" : "anomaly-medium");
+        d.innerHTML = `<div class="anomaly-row">
+          <div style="flex:1;">
+            <div><b>${isHigh ? "🔴" : "🟡"} ${a.rayon_name}</b></div>
+            <div class="m">${a.oblast_kk} • ${a.events.toLocaleString()} событий • ${a.users.toLocaleString()} польз.</div>
+            ${a.reasons.map(rs => `<div class="anomaly-reason">⚠ ${rs}</div>`).join("")}
+          </div>
+        </div>`;
+        el.anomalyList.appendChild(d);
+      });
+      refreshDetailTop();
+    } catch (e) {
+      if (el.anomalySection) el.anomalySection.style.display = "none";
+    }
+  }
+
+  // ---- Behavior Clusters ----
+  function _behaviorColor(pattern) {
+    if (pattern === "work") return "#16a34a";
+    if (pattern === "home") return "#2563eb";
+    if (pattern === "transit") return "#d97706";
+    return "#64748b";
+  }
+
+  function applyBehaviorClusters() {
+    if (!state.detailLayer) return;
+    const labels = { work: "Рабочая зона", home: "Жилая зона", transit: "Транзит", mixed: "Смешанная" };
+    state.detailLayer.eachLayer(lyr => {
+      const fid = lyr.feature?.properties?.full_id;
+      const d = state.behaviorData[fid];
+      if (!d) return;
+      const color = _behaviorColor(d.pattern);
+      lyr.setStyle({ fillColor: color, fillOpacity: 0.45, color: "#0f172a", weight: 1 });
+      lyr.bindTooltip(
+        `<b>${lyr.feature?.properties?.name_kk || "Район"}</b><br>${labels[d.pattern] || d.pattern}<br>Рабочих: ${d.work_pct}% • Ночных: ${d.night_pct}% • Транзит: ${d.transit_pct}%<br>${d.events.toLocaleString()} событий`,
+        { sticky: true }
+      );
+    });
+    if (el.behaviorLegend) el.behaviorLegend.style.display = "";
+  }
+
+  function resetBehaviorClusters() {
+    clearBehaviorGrid();
+    if (el.behaviorLegend) el.behaviorLegend.style.display = "none";
+    if (!state.detailLayer) return;
+    state.detailLayer.eachLayer(lyr => {
+      lyr.setStyle({ color: "#0f172a", weight: 1, fillOpacity: 0.03, fillColor: "#ffffff" });
+      lyr.bindTooltip(lyr.feature?.properties?.name_kk || "район", { sticky: true });
+    });
+  }
+
+  async function loadBehaviorClusters() {
+    if (!state.behaviorEnabled) { resetBehaviorClusters(); return; }
+    const { oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+    if (oblast && oblast !== "ALL") {
+      // Sub-rayon grid: reset polygon colors, show point grid instead
+      if (state.detailLayer) {
+        state.detailLayer.eachLayer(lyr => {
+          lyr.setStyle({ color: "#0f172a", weight: 1, fillOpacity: 0.03, fillColor: "#ffffff" });
+          lyr.bindTooltip(lyr.feature?.properties?.name_kk || "район", { sticky: true });
+        });
+      }
+      await loadBehaviorGrid();
+      return;
+    }
+    // ALL Kazakhstan: rayon-level coloring
+    clearBehaviorGrid();
+    if (!state.detailLayer) return;
+    try {
+      const q = new URLSearchParams({ oblast, period });
+      if (anchorDate) q.set("anchor_date", anchorDate);
+      if (period === "custom") {
+        if (startDate) q.set("start_date", startDate);
+        if (endDate) q.set("end_date", endDate);
+      }
+      state.behaviorData = await fetchJson(`/api/stats/behavior_clusters?${q}`);
+      applyBehaviorClusters();
+    } catch (e) { console.warn("[behavior]", e); }
+  }
+
+  function clearBehaviorGrid() {
+    if (state.behaviorGridLayer) {
+      try { map.removeLayer(state.behaviorGridLayer); } catch (_) {}
+      state.behaviorGridLayer = null;
+    }
+  }
+
+  async function loadBehaviorGrid() {
+    clearBehaviorGrid();
+    const { oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+    try {
+      const q = new URLSearchParams({ oblast, period });
+      if (anchorDate) q.set("anchor_date", anchorDate);
+      if (period === "custom") {
+        if (startDate) q.set("start_date", startDate);
+        if (endDate) q.set("end_date", endDate);
+      }
+      const data = await fetchJson(`/api/stats/behavior_grid?${q}`);
+      if (!data.length) return;
+
+      const maxEv = Math.max(...data.map(d => d.events));
+      const byPattern = { work: [], home: [], transit: [], mixed: [] };
+      for (const d of data) {
+        const w = Math.min(1.0, 0.15 + Math.sqrt(d.events / maxEv) * 0.85);
+        (byPattern[d.pattern] || byPattern.mixed).push([d.lat, d.lon, w]);
+      }
+
+      const gradients = {
+        work:    { 0.1: "#86efac", 0.4: "#22c55e", 1.0: "#15803d" },
+        home:    { 0.1: "#93c5fd", 0.4: "#3b82f6", 1.0: "#1d4ed8" },
+        transit: { 0.1: "#fde68a", 0.4: "#f59e0b", 1.0: "#b45309" },
+      };
+
+      const zoom = map.getZoom();
+      const radius = Math.max(25, Math.min(60, zoom * 4));
+      const blur = Math.max(20, Math.min(50, zoom * 3));
+      const heatLayers = [];
+      for (const [pattern, pts] of Object.entries(byPattern)) {
+        if (!pts.length || pattern === "mixed") continue;
+        // Normalize each pattern independently so rare patterns are still visible
+        const patMax = Math.max(...pts.map(p => p[2]));
+        const normPts = pts.map(([lat, lon, w]) => [lat, lon, w / patMax]);
+        heatLayers.push(L.heatLayer(normPts, { radius, blur, maxZoom: 17, max: 1.0, gradient: gradients[pattern] }));
+      }
+
+      state.behaviorGridLayer = L.layerGroup(heatLayers).addTo(map);
+      if (el.behaviorLegend) el.behaviorLegend.style.display = "";
+      // Prevent heat canvases from intercepting pointer events on rayons below
+      setTimeout(() => {
+        if (state.behaviorGridLayer) {
+          state.behaviorGridLayer.eachLayer(l => {
+            if (l._canvas) l._canvas.style.pointerEvents = "none";
+          });
+        }
+        refreshDetailTop();
+      }, 60);
+    } catch (e) { console.warn("[behavior_grid]", e); }
+  }
+
+  function refreshDetailTop() {
+    if (!state.detailLayer) return;
+    try { state.detailLayer.bringToFront(); } catch (_) {}
+  }
+
   function setClustersVisible(rows){
     const want = !!el.showClusters.checked;
     const ok = (typeof L !== "undefined" && typeof L.markerClusterGroup === "function");
     if(!ok) return;
 
-    if(!state.clusterLayer){
-      state.clusterLayer = L.markerClusterGroup({ showCoverageOnHover:false, chunkedLoading:true });
+    // Destroy and recreate each time to avoid residual event handlers
+    if(state.clusterLayer){
+      try { if(map.hasLayer(state.clusterLayer)) map.removeLayer(state.clusterLayer); } catch(_){}
+      state.clusterLayer = null;
     }
-    state.clusterLayer.clearLayers();
     if(!want){
-      if(map.hasLayer(state.clusterLayer)) map.removeLayer(state.clusterLayer);
+      refreshDetailTop();
       return;
     }
-    if(!map.hasLayer(state.clusterLayer)) map.addLayer(state.clusterLayer);
+
+    state.clusterLayer = L.markerClusterGroup({ showCoverageOnHover:false, chunkedLoading:true });
+    map.addLayer(state.clusterLayer);
 
     const maxN = Math.min(rows.length, 12000);
     for(let i=0;i<maxN;i++){
@@ -621,6 +942,7 @@
       );
       state.clusterLayer.addLayer(marker);
     }
+    refreshDetailTop();
   }
 
   function renderTopRegions(selectedOblast){
@@ -637,7 +959,7 @@
 
     state.topRegionsLayer = L.geoJSON({type:"FeatureCollection", features: feats}, {
       pane: "oblastPane",
-      renderer: L.canvas(),
+      renderer: _oblastRenderer,
       style: () => baseStyle,
       onEachFeature: (f, lyr) => {
         killFocus(lyr);
@@ -676,7 +998,7 @@
 
     state.detailLayer = L.geoJSON(fc, {
       pane: "rayonPane",
-      renderer: L.canvas(),
+      renderer: _rayonRenderer,
       style: { color:"#0f172a", weight:1, fillOpacity:0.03 },
       onEachFeature: (f, lyr) => {
         killFocus(lyr);
@@ -692,6 +1014,7 @@
       try{ map.fitBounds(state.detailLayer.getBounds(), {padding:[20,20]}); }catch(e){}
     }
     if (state.choroplethEnabled) setTimeout(() => loadChoropleth(), 0);
+    if (state.behaviorEnabled) setTimeout(() => loadBehaviorClusters(), 0);
   }
 
   async function onRayonClick(feature){
@@ -729,6 +1052,8 @@
       minH: state.currentFilter.minH,
       maxH: state.currentFilter.maxH,
     });
+
+    renderTransferSidebarSection(state.selectedRayon);
   }
 
   async function refreshSelectedRayonStats(fallbackTitle){
@@ -775,6 +1100,205 @@
     el.timeVal.innerText = fmtHour(minH) + " — " + fmtHour(maxH);
   }
 
+  // ---- Transfer dot overlay (raw points only, shown when zoom >= 13) ----
+  function _removeTransferLayer(){
+    if(state.transferLayer){
+      try{ map.removeLayer(state.transferLayer); }catch(_){}
+      state.transferLayer = null;
+    }
+  }
+
+  function renderTransferDots(rows){
+    _removeTransferLayer();
+    const zoom = map.getZoom();
+    const legend = document.getElementById("transferDotLegend");
+    // Only render individual dots when we have raw points (no step aggregation)
+    const isRaw = rows.length > 0 && rows[0].has_transfer !== undefined;
+    if(!isRaw || zoom < 13){
+      if(legend) legend.style.display = "none";
+      return;
+    }
+    const group = L.featureGroup();
+    const TR_PURPOSE_COLORS = {
+      p2p_local:     "#27ae60",
+      p2p_abroad:    "#e74c3c",
+      invest:        "#e67e22",
+      conversion:    "#f39c12",
+      deposit:       "#8e44ad",
+      iban_external: "#2980b9",
+      budget:        "#e91e8c",
+      transfer:      "#95a5a6",
+    };
+    rows.forEach(p => {
+      if(!p.has_transfer) return;
+      const color = TR_PURPOSE_COLORS[p.purpose_cat] || "#f2b705";
+      const m = L.circleMarker([p.lat, p.lon], {
+        radius: 7,
+        color: "#fff",
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 0.9,
+        pane: "markerPane",
+      });
+      m.bindTooltip(`Перевод в сессии${p.purpose_cat ? " · " + p.purpose_cat : ""}`, { sticky: true });
+      group.addLayer(m);
+    });
+    state.transferLayer = group;
+    group.addTo(map);
+    if(legend) legend.style.display = "flex";
+  }
+
+  // ---- Transfer heat layer (separate from auth heatmap) ----
+  const TR_HEAT_GRADIENT = {0.15:"#134e4a", 0.4:"#0d9488", 0.65:"#34d399", 0.85:"#fcd34d", 1.0:"#f97316"};
+  const TR_PURPOSE_COLORS_MAP = {
+    p2p_local:"#0d9488", p2p_abroad:"#ef4444", invest:"#f97316",
+    conversion:"#eab308", deposit:"#8b5cf6", iban_external:"#3b82f6",
+    budget:"#ec4899", transfer:"#95a5a6",
+  };
+  const TR_PURPOSE_LABELS = {
+    p2p_local:"P2P локал", p2p_abroad:"P2P зарубеж", invest:"Инвестиции",
+    conversion:"Конвертация", deposit:"Депозит", iban_external:"IBAN внешний",
+    budget:"Бюджет", transfer:"Прочее",
+  };
+
+  function _removeTransferHeatLayer() {
+    if (state.transferHeatLayer) {
+      try { map.removeLayer(state.transferHeatLayer); } catch (_) {}
+      state.transferHeatLayer = null;
+    }
+  }
+
+  async function loadTransferLayer() {
+    _removeTransferHeatLayer();
+    const legend = document.getElementById("transferDotLegend");
+    const { period, anchorDate, startDate, endDate, oblast } = state.currentFilter;
+    const b = map.getBounds();
+    const zoom = map.getZoom();
+    const q = new URLSearchParams({
+      min_lat: String(b.getSouth()), max_lat: String(b.getNorth()),
+      min_lon: String(b.getWest()),  max_lon: String(b.getEast()),
+      zoom: String(zoom), period, oblast,
+    });
+    if (anchorDate) q.set("anchor_date", anchorDate);
+    if (period === "custom") {
+      if (startDate) q.set("start_date", startDate);
+      if (endDate) q.set("end_date", endDate);
+    }
+    const purp = el.purposeSelect?.value;
+    if (purp) q.set("purpose_cats", purp);
+
+    try {
+      const rows = await fetchJson(`/api/transfers/points?${q}`);
+      if (!rows || !rows.length) { if(legend) legend.style.display = "none"; return; }
+
+      // Always heatmap — no individual dot markers in global view
+      const heatData = rows.map(r => [
+        r.lat, r.lon,
+        r.count !== undefined
+          ? Math.min(5, 0.2 + Math.log((r.count || 1) + 1))
+          : 0.7,
+      ]);
+      state.transferHeatLayer = L.heatLayer(heatData, {
+        radius: 34, blur: 26, maxZoom: 17, gradient: TR_HEAT_GRADIENT,
+      }).addTo(map);
+
+      if (legend) legend.style.display = "flex";
+      refreshDetailTop();
+    } catch (e) { console.warn("[transfer layer]", e); }
+  }
+
+  async function loadTransferDashboard() {
+    const { period, anchorDate, startDate, endDate, oblast } = state.currentFilter;
+    const q = new URLSearchParams({ period, oblast });
+    if (anchorDate) q.set("anchor_date", anchorDate);
+    if (period === "custom") {
+      if (startDate) q.set("start_date", startDate);
+      if (endDate) q.set("end_date", endDate);
+    }
+    const purp = el.purposeSelect?.value;
+    if (purp) q.set("purpose_cats", purp);
+    try {
+      const data = await fetchJson(`/api/transfers/dashboard?${q}`);
+      state.transferDash = data;
+      const kpi = data.kpi || {};
+      if (el.dbTrCount) animateNum(el.dbTrCount, kpi.count || 0);
+      if (el.dbTrVol) el.dbTrVol.textContent = fmtMln(kpi.volume_kzt || 0);
+      if (el.dbTrAvg) el.dbTrAvg.textContent = fmtMln(kpi.avg_kzt || 0);
+      if (el.dbTrUsers) animateNum(el.dbTrUsers, kpi.users || 0);
+      [el.dbTrCountCard, el.dbTrVolCard, el.dbTrAvgCard, el.dbTrUsersCard].forEach(c => {
+        if (c) c.style.display = state.layerMode !== "auth" ? "" : "none";
+      });
+    } catch(e) { console.warn("[transfer dash]", e); }
+  }
+
+  function renderTransferSidebarSection(rayonId) {
+    if (!el.transferStatsSection) return;
+    const lm = state.layerMode;
+    if (lm === "auth") { el.transferStatsSection.style.display = "none"; return; }
+    if (!state.transferDash) { el.transferStatsSection.style.display = "none"; return; }
+
+    // Find rayon in transfer dashboard top list
+    const top = (state.transferDash.top_rayons || []).find(r => r.rayon_id === rayonId);
+    if (!top) {
+      // No data for this rayon specifically — show global transfer stats
+      const kpi = state.transferDash.kpi || {};
+      if (el.kpiTrCount) el.kpiTrCount.textContent = fmtNum(kpi.count || 0);
+      if (el.kpiTrVol) el.kpiTrVol.textContent = fmtMln(kpi.volume_kzt || 0);
+      if (el.kpiTrAvg) el.kpiTrAvg.textContent = fmtMln(kpi.avg_kzt || 0);
+      if (el.kpiTrConv) el.kpiTrConv.textContent = "—";
+    } else {
+      if (el.kpiTrCount) el.kpiTrCount.textContent = fmtNum(top.count || 0);
+      if (el.kpiTrVol) el.kpiTrVol.textContent = fmtMln(top.volume_kzt || 0);
+      if (el.kpiTrAvg) el.kpiTrAvg.textContent = top.count ? fmtMln((top.volume_kzt || 0) / top.count) : "—";
+      if (el.kpiTrConv) el.kpiTrConv.textContent = "—";
+    }
+
+    // Purpose breakdown bars
+    if (el.purposeBreakdown) {
+      const purposes = state.transferDash.by_purpose || [];
+      const maxVol = Math.max(1, ...purposes.map(p => p.volume_kzt));
+      el.purposeBreakdown.innerHTML = purposes.slice(0, 6).map(p => {
+        const pct = Math.round((p.volume_kzt / maxVol) * 100);
+        const color = TR_PURPOSE_COLORS_MAP[p.purpose_cat] || "#95a5a6";
+        return `<div class="tr-purpose-bar">
+          <span style="width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${TR_PURPOSE_LABELS[p.purpose_cat] || p.purpose_cat}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color};"></div></div>
+          <span style="width:55px;text-align:right;">${fmtMln(p.volume_kzt)}</span>
+        </div>`;
+      }).join("");
+    }
+
+    el.transferStatsSection.style.display = "";
+  }
+
+  function fmtMln(v) {
+    if (v >= 1e9) return (v / 1e9).toFixed(1) + " млрд";
+    if (v >= 1e6) return (v / 1e6).toFixed(1) + " млн";
+    if (v >= 1e3) return (v / 1e3).toFixed(0) + "K";
+    return Math.round(v).toLocaleString();
+  }
+
+  function applyLayerModeUi(mode) {
+    [el.layerAuth, el.layerTransfer, el.layerBoth].forEach((btn, i) => {
+      if (btn) btn.classList.toggle("active", ["auth","transfer","both"][i] === mode);
+    });
+    if (el.purposeFilterPill) el.purposeFilterPill.style.display = mode !== "auth" ? "" : "none";
+  }
+
+  function setLayerMode(mode) {
+    state.layerMode = mode;
+    applyLayerModeUi(mode);
+    reloadPointsOnly();
+    if (mode !== "auth") {
+      loadTransferDashboard().catch(() => {});
+    } else {
+      [el.dbTrCountCard, el.dbTrVolCard, el.dbTrAvgCard, el.dbTrUsersCard].forEach(c => {
+        if (c) c.style.display = "none";
+      });
+      if (el.transferStatsSection) el.transferStatsSection.style.display = "none";
+    }
+  }
+
   function updateHeatLayer(rows){
     if(el.showClusters.checked){
       if(state.heatLayer && map.hasLayer(state.heatLayer)){
@@ -795,7 +1319,6 @@
       return;
     }
     if(!map.hasLayer(state.heatLayer)){
-      // Layer object exists but is detached after cluster toggles.
       state.heatLayer.addTo(map);
     }
     try{
@@ -813,6 +1336,7 @@
   async function reloadPointsOnly(){
     const requestId = ++state.lastRequestId;
     const { minH, maxH, oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+    const lm = state.layerMode;
 
     const b = map.getBounds();
     const q = new URLSearchParams({
@@ -825,6 +1349,7 @@
       max_h: String(maxH),
       oblast,
       period,
+      layer_mode: lm === "auth" ? "no_transfer" : "all",
     });
     if(anchorDate) q.set("anchor_date", anchorDate);
     if(period === "custom"){
@@ -835,11 +1360,29 @@
       q.set("rayon_id", state.selectedRayon);
     }
 
-    const rows = await fetchJson(`/api/points?${q.toString()}`);
-    if(requestId !== state.lastRequestId) return;
+    // In pure transfer mode skip auth fetch entirely
+    let rows = [];
+    if (lm !== "transfer") {
+      rows = await fetchJson(`/api/points?${q.toString()}`);
+      if(requestId !== state.lastRequestId) return;
+    }
 
     state.lastFiltered = rows;
-    updateHeatLayer(rows);
+
+    // Auth heatmap
+    if (lm === "transfer") {
+      if (state.heatLayer && map.hasLayer(state.heatLayer)) map.removeLayer(state.heatLayer);
+    } else {
+      updateHeatLayer(rows);
+    }
+
+    // Transfer heatmap (both / transfer modes)
+    if (lm !== "auth") {
+      loadTransferLayer();
+    } else {
+      _removeTransferHeatLayer();
+    }
+
     renderHotspots(computeHotspots(rows));
     setClustersVisible(rows);
   }
@@ -863,6 +1406,20 @@
     }
     if(el.dbEventsDelta) el.dbEventsDelta.textContent = "";
     if(el.dbUsersDelta) el.dbUsersDelta.textContent = "";
+
+    // Conversion KPI (session join data)
+    const sess = payload?.session;
+    const convCard = document.getElementById("dbConvCard");
+    const convPct  = document.getElementById("dbConvPct");
+    const convSess = document.getElementById("dbConvSessions");
+    if(sess && payload?.has_session_data && convCard){
+      convCard.style.display = "";
+      if(convPct)  convPct.textContent  = (sess.conversion_pct ?? 0) + "%";
+      if(convSess) convSess.textContent = `${(sess.transfer_sessions || 0).toLocaleString()} из ${(sess.total_sessions || 0).toLocaleString()}`;
+    } else if(convCard){
+      convCard.style.display = "none";
+    }
+
     el.sidebar.style.display = "block";
 
     if(!state.selectedRayon){
@@ -903,11 +1460,6 @@
       el.topRayonsList.appendChild(d);
     });
 
-    el.dataQuality.innerHTML = `
-      <div class="row-lite"><span>Район размечен</span><b>${q.rayon_tagged_pct ?? 0}%</b></div>
-      <div class="row-lite"><span>Область размечена</span><b>${q.oblast_tagged_pct ?? 0}%</b></div>
-      <div class="row-lite"><span>ИИН заполнен</span><b>${q.iin_filled_pct ?? 0}%</b></div>
-    `;
   }
 
   async function reloadDashboard(){
@@ -958,32 +1510,13 @@
       }
     } catch(e){ /* trend is optional */ }
 
-    // Fetch devices breakdown
-    try {
-      const devQ = new URLSearchParams({ oblast, period });
-      if(anchorDate) devQ.set("anchor_date", anchorDate);
-      if(period === "custom"){
-        if(startDate) devQ.set("start_date", startDate);
-        if(endDate) devQ.set("end_date", endDate);
-      }
-      if(state.selectedRayon && (oblast === "ALL" || state.selectedRayonOblast === oblast)){
-        devQ.set("rayon_id", state.selectedRayon);
-      }
-      const devData = await fetchJson(`/api/stats/devices?${devQ.toString()}`);
-      if(devData?.available && devData.items?.length > 0){
-        if(el.devicesTitle) el.devicesTitle.style.display = "";
-        if(el.devicesList){
-          el.devicesList.innerHTML = devData.items.slice(0,8).map(d =>
-            `<div class="row-lite"><div><div><b>${d.device_type}</b></div><div class="m">${d.users.toLocaleString()} польз.</div></div><div><b>${d.pct}%</b></div></div>`
-          ).join("");
-        }
-      } else {
-        if(el.devicesTitle) el.devicesTitle.style.display = "none";
-        if(el.devicesList) el.devicesList.innerHTML = "";
-      }
-    } catch(e){ /* devices optional */ }
-
     if (state.choroplethEnabled) await loadChoropleth();
+
+    // Run compare and anomalies in parallel — don't block dashboard render
+    Promise.all([
+      loadPeriodCompare().catch(() => {}),
+      loadAnomalies().catch(() => {}),
+    ]);
   }
 
   async function refreshLayers(forceFitBounds){
@@ -1044,6 +1577,7 @@
       }
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.modeEvents.addEventListener("change", async ()=>{
       syncFilterFromUi();
@@ -1064,6 +1598,7 @@
       await refreshLayers(changed);
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.showDetails.addEventListener("change", async ()=>{
       stopPlayback();
@@ -1087,6 +1622,7 @@
       }
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.periodStart?.addEventListener("change", async ()=>{
       stopPlayback();
@@ -1097,6 +1633,7 @@
       }
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.periodEnd?.addEventListener("change", async ()=>{
       stopPlayback();
@@ -1107,6 +1644,7 @@
       }
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.anchorDate?.addEventListener("change", async ()=>{
       syncFilterFromUi();
@@ -1116,6 +1654,7 @@
       }
       await reloadPointsOnly();
       await reloadDashboard();
+      if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
     });
     el.showClusters.addEventListener("change", ()=>{
       updateHeatLayer(state.lastFiltered);
@@ -1129,6 +1668,35 @@
           await loadChoropleth();
         } else {
           resetChoropleth();
+        }
+      });
+    }
+
+    if (el.showBehavior) {
+      el.showBehavior.addEventListener("change", async () => {
+        state.behaviorEnabled = !!el.showBehavior.checked;
+        if (state.behaviorEnabled) {
+          await loadBehaviorClusters();
+        } else {
+          resetBehaviorClusters();
+        }
+      });
+    }
+
+    if (el.layerAuth) {
+      el.layerAuth.addEventListener("click", () => setLayerMode("auth"));
+    }
+    if (el.layerTransfer) {
+      el.layerTransfer.addEventListener("click", () => setLayerMode("transfer"));
+    }
+    if (el.layerBoth) {
+      el.layerBoth.addEventListener("click", () => setLayerMode("both"));
+    }
+    if (el.purposeSelect) {
+      el.purposeSelect.addEventListener("change", async () => {
+        if (state.layerMode !== "auth") {
+          await loadTransferLayer();
+          await loadTransferDashboard();
         }
       });
     }
@@ -1182,7 +1750,7 @@
         if(el.dowHourChart) el.dowHourChart.style.display = state.chartMode === "dowhour" ? "" : "none";
         if(state.chartMode === "dowhour"){
           try{
-            const { minH, maxH, oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
+            const { oblast, period, anchorDate, startDate, endDate } = state.currentFilter;
             const q = new URLSearchParams({ oblast, period });
             if(anchorDate) q.set("anchor_date", anchorDate);
             if(period === "custom"){
@@ -1198,10 +1766,13 @@
         }
       });
     }
+    // Sync layer mode button to initial state (UI only, no reload)
+    applyLayerModeUi(state.layerMode);
     state.lastOblast = state.currentFilter.oblast;
     await refreshLayers(false);
     await reloadPointsOnly();
     await reloadDashboard();
+    if (state.layerMode !== "auth") loadTransferDashboard().catch(() => {});
   }
 
   init().catch(err => {

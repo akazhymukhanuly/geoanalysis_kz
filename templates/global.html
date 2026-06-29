@@ -15,6 +15,21 @@
   <style>
     html, body { height: 100%; margin: 0; }
     #map { height: 100vh; width: 100%; }
+    .anomaly-item { padding: 6px 8px; border-radius: 7px; margin-bottom: 5px; font-size: 12px; }
+    .anomaly-high { background: rgba(239,68,68,0.1); border-left: 3px solid #ef4444; }
+    .anomaly-medium { background: rgba(245,158,11,0.1); border-left: 3px solid #f59e0b; }
+    .anomaly-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; }
+    .anomaly-reason { color: #b45309; font-size: 11px; margin-top: 2px; }
+    .cmp-cur { color: #d32f2f; font-weight: 700; }
+    .cmp-prev { color: #64748b; font-weight: 700; }
+    #transferDotLegend { position:fixed; bottom:54px; right:12px; background:var(--panel,rgba(255,255,255,.92)); border:1px solid var(--line,rgba(0,0,0,.1)); border-radius:8px; padding:5px 9px; font-size:11px; display:none; gap:10px; align-items:center; z-index:900; }
+    .tdl-dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex-shrink:0; }
+    .layer-seg { display:flex; gap:2px; background:var(--panel2,rgba(0,0,0,.06)); border-radius:8px; padding:2px; }
+    .layer-seg button { border:none; background:transparent; padding:3px 10px; border-radius:6px; font-size:12px; cursor:pointer; color:inherit; transition:background .15s; white-space:nowrap; }
+    .layer-seg button.active { background:var(--panel,#fff); box-shadow:0 1px 3px rgba(0,0,0,.15); font-weight:700; }
+    .tr-purpose-bar { display:flex; align-items:center; gap:6px; font-size:11px; margin-bottom:3px; }
+    .tr-purpose-bar .bar-track { flex:1; height:6px; background:var(--line,rgba(0,0,0,.08)); border-radius:3px; overflow:hidden; }
+    .tr-purpose-bar .bar-fill { height:100%; border-radius:3px; background:#0d9488; }
   </style>
 </head>
 <body>
@@ -79,6 +94,30 @@
     <label class="pill" title="Закрасить районы по плотности">
       <input type="checkbox" id="showChoropleth"> Хороплет
     </label>
+    <label class="pill" title="Поведенческая кластеризация районов: рабочая/жилая/транзит">
+      <input type="checkbox" id="showBehavior"> Поведение
+    </label>
+    <div class="pill" style="padding:3px 6px;">
+      <div class="layer-seg">
+        <button id="layerAuth" type="button" title="Авторизации без переводов">🔵 Авт</button>
+        <button id="layerTransfer" type="button" title="Только переводы">🟢 Перев</button>
+        <button id="layerBoth" class="active" type="button" title="Авторизации и переводы">⊕ Оба</button>
+      </div>
+    </div>
+    <label class="pill" id="purposeFilterPill" style="display:none;" title="Тип перевода">
+      <span style="opacity:.8;">Тип</span>
+      <select id="purposeSelect">
+        <option value="">Все типы</option>
+        <option value="p2p_local">P2P локальный</option>
+        <option value="p2p_abroad">P2P зарубеж</option>
+        <option value="invest">Инвестиции</option>
+        <option value="conversion">Конвертация</option>
+        <option value="deposit">Депозит</option>
+        <option value="iban_external">IBAN внешний</option>
+        <option value="budget">Бюджет</option>
+        <option value="transfer">Прочее</option>
+      </select>
+    </label>
     <button class="pill" id="darkModeBtn" type="button" title="Тёмная тема">🌙</button>
   </div>
   <button class="pill topbar-toggle" id="topbarToggle" type="button" title="Свернуть верхнюю панель">▴ Свернуть</button>
@@ -91,6 +130,27 @@
   <div class="db-card"><span>Тег районов</span><b id="dbRayonPct">0%</b></div>
   <div class="db-card"><span>Период</span><b id="dbPeriod">-</b></div>
   <div class="db-card"><span>Охват районов</span><b id="dbCoverage">—</b></div>
+  <div class="db-card" id="dbConvCard" style="display:none;" title="Доля авторизаций с переводом в той же сессии">
+    <span>Конверсия → перевод</span>
+    <b id="dbConvPct">0%</b>
+    <em id="dbConvSessions" style="font-size:10px;color:var(--muted,#697386);"></em>
+  </div>
+  <div class="db-card" id="dbTrCountCard" style="display:none;">
+    <span>Переводов</span>
+    <b id="dbTrCount">0</b>
+  </div>
+  <div class="db-card" id="dbTrVolCard" style="display:none;">
+    <span>Объём KZT</span>
+    <b id="dbTrVol">0</b>
+  </div>
+  <div class="db-card" id="dbTrAvgCard" style="display:none;">
+    <span>Ср. сумма</span>
+    <b id="dbTrAvg">0</b>
+  </div>
+  <div class="db-card" id="dbTrUsersCard" style="display:none;">
+    <span>Плательщиков</span>
+    <b id="dbTrUsers">0</b>
+  </div>
 </div>
 
 <div id="sidebar">
@@ -142,6 +202,19 @@
     </div>
   </div>
 
+  <div id="transferStatsSection" style="display:none;margin-bottom:10px;padding:10px;background:var(--panel2);border-radius:10px;border:1px solid var(--line);">
+    <div style="font-size:12px;font-weight:700;margin-bottom:8px;color:#0d9488;">💳 Аналитика переводов</div>
+    <div class="kpis" style="margin-bottom:8px;">
+      <div class="kpi"><div class="l">Переводов</div><div class="v" id="kpiTrCount">0</div><div class="s">в районе</div></div>
+      <div class="kpi"><div class="l">Объём KZT</div><div class="v" id="kpiTrVol">—</div><div class="s">сумма</div></div>
+    </div>
+    <div class="kpis" style="margin-bottom:8px;">
+      <div class="kpi"><div class="l">Ср. сумма</div><div class="v" id="kpiTrAvg">—</div><div class="s">на перевод</div></div>
+      <div class="kpi"><div class="l">Конверсия</div><div class="v" id="kpiTrConv">—</div><div class="s">авт → перевод</div></div>
+    </div>
+    <div id="purposeBreakdown"></div>
+  </div>
+
   <div id="miniChartWrap">
     <div id="miniChartTitle" style="display:flex;align-items:center;gap:8px;">
       <span>Распределение по часам</span>
@@ -151,14 +224,29 @@
     <canvas id="dowHourChart" style="display:none;"></canvas>
   </div>
 
+  <div id="compareSection" style="display:none;margin-top:10px;padding:10px;background:var(--panel2);border-radius:10px;border:1px solid var(--line);">
+    <div style="font-size:12px;font-weight:700;margin-bottom:6px;">Сравнение периодов</div>
+    <div id="compareLegend" style="font-size:10px;margin-bottom:6px;display:flex;gap:10px;flex-wrap:wrap;"></div>
+    <canvas id="compareChart" height="80" style="width:100%;display:block;border-radius:4px;cursor:crosshair;"></canvas>
+  </div>
+
   <div id="hotspots">
     <div id="choroplethLegend" style="display:none;margin-bottom:12px;"></div>
+    <div id="behaviorLegend" style="display:none;margin-bottom:12px;padding:8px;background:var(--panel2);border-radius:8px;border:1px solid var(--line);font-size:11px;">
+      <div style="font-weight:700;margin-bottom:5px;">Паттерны активности</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <span style="display:flex;align-items:center;gap:3px;"><span style="background:#16a34a;width:10px;height:10px;border-radius:2px;display:inline-block;"></span>Рабочая</span>
+        <span style="display:flex;align-items:center;gap:3px;"><span style="background:#2563eb;width:10px;height:10px;border-radius:2px;display:inline-block;"></span>Жилая</span>
+        <span style="display:flex;align-items:center;gap:3px;"><span style="background:#d97706;width:10px;height:10px;border-radius:2px;display:inline-block;"></span>Транзит</span>
+        <span style="display:flex;align-items:center;gap:3px;"><span style="background:#64748b;width:10px;height:10px;border-radius:2px;display:inline-block;"></span>Смешанная</span>
+      </div>
+    </div>
     <h4>Топ районов</h4>
     <div id="topRayonsList"></div>
-    <h4>Качество данных</h4>
-    <div id="dataQuality"></div>
-    <h4 id="devicesTitle" style="display:none;">Устройства</h4>
-    <div id="devicesList"></div>
+    <div id="anomalySection" style="display:none;margin-top:8px;margin-bottom:4px;">
+      <h4 style="margin:0 0 6px;">Аномалии <span id="anomalyCount" style="font-size:11px;font-weight:400;color:var(--muted);"></span></h4>
+      <div id="anomalyList"></div>
+    </div>
     <h4>Топ зон активности</h4>
     <div id="hsList"></div>
   </div>
@@ -170,13 +258,21 @@
   <div class="s"><span>низкая</span><span>высокая</span></div>
 </div>
 
+<div id="transferDotLegend">
+  <span class="tdl-dot" style="background:#0d9488;"></span> P2P локал
+  <span class="tdl-dot" style="background:#ef4444;"></span> P2P зарубеж
+  <span class="tdl-dot" style="background:#f97316;"></span> Инвест
+  <span class="tdl-dot" style="background:#8b5cf6;"></span> Депозит
+  <span class="tdl-dot" style="background:#3b82f6;"></span> IBAN
+  <span class="tdl-dot" style="background:#95a5a6;"></span> Прочее
+</div>
 <div id="chartTip"></div>
 
-<script src="/staticgeo/leaflet/leaflet.js"></script>
-<script src="/staticgeo/leaflet/leaflet-heat.js"></script>
-<script src="/staticgeo/leaflet/turf.min.js"></script>
-<script src="/staticgeo/leaflet/nouislider.min.js"></script>
-<script src="/staticgeo/leaflet/leaflet.markercluster.js"></script>
-<script src="/staticgeo/js/global.js?v=20260318"></script>
+<script src="/staticgeo/leaflet/leaflet.js" charset="utf-8"></script>
+<script src="/staticgeo/leaflet/leaflet-heat.js" charset="utf-8"></script>
+<script src="/staticgeo/leaflet/turf.min.js" charset="utf-8"></script>
+<script src="/staticgeo/leaflet/nouislider.min.js" charset="utf-8"></script>
+<script src="/staticgeo/leaflet/leaflet.markercluster.js" charset="utf-8"></script>
+<script src="/staticgeo/js/global.js?v=20260424" charset="utf-8"></script>
 </body>
 </html>
